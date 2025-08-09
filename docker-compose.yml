@@ -1,0 +1,20 @@
+version: "3.9"
+services:
+  web:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+    volumes:
+      - .:/app
+  scheduler:
+    build: .
+    command: ["python", "main.py", "schedule"]
+    depends_on:
+      - web
+    environment:
+      - PORT=8000
+    volumes:
+      - .:/app
+
