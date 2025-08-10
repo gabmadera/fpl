@@ -28,7 +28,7 @@ from src.pipeline import DataPipeline
 from src.historical_loader import HistoricalDataLoader
 from src.ml_pipeline import MLPipeline
 from src.player_index import build_player_index
-from src.web_app import app as web_app  # for uvicorn
+from src.web_ui_enhanced import app as web_app  # Enhanced UI
 
 
 def main() -> None:
@@ -190,7 +190,15 @@ def start_web() -> None:
     except Exception:
         print("uvicorn not installed; run: pip install uvicorn")
         return
-    uvicorn.run("src.web_app:app", host="0.0.0.0", port=8000, reload=False)
+    print("Starting FPL AI Dashboard on http://localhost:8001")
+    print("Features:")
+    print("- Beautiful modern FPL-style interface with glass morphism")
+    print("- Real player predictions with xG/xA data")
+    print("- Interactive charts and filtering")
+    print("- Mobile-responsive design")
+    print("- AI-powered insights and recommendations")
+    print("")
+    uvicorn.run("src.web_ui_enhanced:app", host="0.0.0.0", port=8001, reload=False)
 
 
 if __name__ == "__main__":
