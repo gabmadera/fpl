@@ -189,10 +189,11 @@ class XGBoostTrainer:
             
             # Ensure we have the same features as training
             if self.feature_names:
-                # Add missing features with zeros
-                for feature in self.feature_names:
-                    if feature not in X_processed.columns:
-                        X_processed[feature] = 0
+                # Add missing features with zeros efficiently
+                missing_features = [f for f in self.feature_names if f not in X_processed.columns]
+                if missing_features:
+                    missing_df = pd.DataFrame(0, index=X_processed.index, columns=missing_features)
+                    X_processed = pd.concat([X_processed, missing_df], axis=1)
                 # Select only training features in correct order
                 X_processed = X_processed[self.feature_names]
             

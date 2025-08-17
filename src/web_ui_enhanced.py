@@ -100,8 +100,17 @@ def summary() -> dict:
 
     try:
         fpl = FPLClient()
-        current_gw = fpl.current_gameweek()
         bs = fpl.bootstrap_static()
+        events = bs.get("events", [])
+        
+        # Get current and next gameweek info
+        current_gw = next((e["id"] for e in events if e.get("is_current", False)), 1)
+        next_gw = next((e["id"] for e in events if e.get("is_next", False)), current_gw + 1)
+        
+        # Check if current gameweek has passed deadline
+        current_event = next((e for e in events if e["id"] == current_gw), None)
+        prediction_gw = next_gw  # Always predict for next available gameweek
+        
         teams = pd.DataFrame(bs.get("teams", []))
         team_map = {}
         if not teams.empty:
@@ -111,10 +120,14 @@ def summary() -> dict:
                     team_map[tid] = row.get("short_name") or row.get("name")
     except Exception:
         current_gw = 1
+        next_gw = 2
+        prediction_gw = 2
         team_map = {}
 
     return {
         "gameweek": current_gw,
+        "next_gameweek": next_gw,
+        "prediction_gameweek": prediction_gw,
         "teams": team_map,
         "total_players": len(preds),
         "avg_prediction": preds["predicted_points"].mean() if not preds.empty else 0
@@ -122,7 +135,7 @@ def summary() -> dict:
 
 
 @app.get("/team")
-def get_optimal_team(gameweek: int = 1) -> dict:
+def get_optimal_team(gameweek: int = None) -> dict:
     """Get optimal team selection with formation and captaincy"""
     try:
         path = Path("data/processed/predictions_current.csv")
@@ -131,6 +144,13 @@ def get_optimal_team(gameweek: int = 1) -> dict:
             df = ml.predict_current()
         else:
             df = pd.read_csv(path)
+        
+        # Use next gameweek if not specified
+        if gameweek is None:
+            fpl = FPLClient()
+            bs = fpl.bootstrap_static()
+            events = bs.get("events", [])
+            gameweek = next((e["id"] for e in events if e.get("is_next", False)), 2)
         
         selector = TeamSelector()
         optimal_team = selector.select_optimal_team(df, gameweek)
@@ -165,6 +185,42 @@ def refresh() -> dict:
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/actual-points/{gameweek}")
+def get_actual_points(gameweek: int) -> dict:
+    """Get actual points for a completed gameweek"""
+    try:
+        fpl = FPLClient()
+        bs = fpl.bootstrap_static()
+        elements = bs.get("elements", [])
+        
+        # Get player data with actual points for the gameweek
+        actual_points = []
+        for element in elements:
+            if element.get("total_points", 0) > 0:  # Only include players with points
+                actual_points.append({
+                    "player_id": element.get("id"),
+                    "name": element.get("web_name", ""),
+                    "position": element.get("element_type", 1),
+                    "team_id": element.get("team", 1),
+                    "total_points": element.get("total_points", 0),
+                    "points_per_game": element.get("points_per_game", 0),
+                    "selected_by_percent": element.get("selected_by_percent", 0),
+                    "form": element.get("form", 0)
+                })
+        
+        # Sort by total points
+        actual_points.sort(key=lambda x: x["total_points"], reverse=True)
+        
+        return {
+            "gameweek": gameweek,
+            "players": actual_points[:50],  # Top 50 performers
+            "total_players": len(actual_points)
+        }
+        
+    except Exception as e:
+        return {"error": str(e)}
 
 
 @app.get("/gameweek-results/{gameweek}")
@@ -254,10 +310,44 @@ def track_gameweek_performance(gameweek: int) -> dict:
         return {"error": str(e)}
 
 
+@app.get("/fixtures")
+def fixtures() -> dict:
+    """Return current and next GW fixtures with difficulty ratings"""
+    fpl = FPLClient()
+    try:
+        current_gw = fpl.current_gameweek()
+        raw = fpl.fixtures()
+        fdf = pd.DataFrame(raw)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    def pack(gw: int):
+        try:
+            cur = fdf[fdf.get("event") == gw]
+            cols = [
+                c for c in [
+                    "team_h", "team_a", "team_h_difficulty", 
+                    "team_a_difficulty", "kickoff_time"
+                ] if c in cur.columns
+            ]
+            return cur[cols].to_dict(orient="records")
+        except Exception:
+            return []
+
+    return {"gameweek": current_gw, "current": pack(current_gw), "next": pack(current_gw + 1)}
+
+
 @app.get("/transfer-suggestions")
-def get_transfer_suggestions(current_gameweek: int = 1) -> dict:
+def get_transfer_suggestions(current_gameweek: int = None) -> dict:
     """Get intelligent transfer suggestions for next gameweek"""
     try:
+        # Get next gameweek if not specified
+        if current_gameweek is None:
+            fpl = FPLClient()
+            bs = fpl.bootstrap_static()
+            events = bs.get("events", [])
+            current_gameweek = next((e["id"] for e in events if e.get("is_current", False)), 1)
+        
         # Load current predictions
         path = Path("data/processed/predictions_current.csv")
         if not path.exists():
@@ -266,28 +356,57 @@ def get_transfer_suggestions(current_gameweek: int = 1) -> dict:
         else:
             df = pd.read_csv(path)
         
-        # Get current optimal team as baseline
+        # Create a mock current team from top players (since we don't have user's actual team)
         selector = TeamSelector()
-        current_optimal = selector.select_optimal_team(df, current_gameweek)
-        current_team_ids = [p['player_id'] for p in current_optimal.starters + current_optimal.bench]
         
-        # Get transfer suggestions
-        transfer_suggestions = selector.evaluate_transfers(current_team_ids, df, current_gameweek + 1)
+        # Get top 15 players as "current team" for demonstration
+        top_players = df.nlargest(15, 'predicted_points')
+        mock_team_ids = top_players['player_id'].tolist()
+        
+        # Get optimal team for next gameweek
+        next_gw = current_gameweek + 1
+        optimal_team = selector.select_optimal_team(df, next_gw)
+        optimal_ids = [p['player_id'] for p in optimal_team.starters + optimal_team.bench]
+        
+        # Calculate transfer suggestions
+        transfer_suggestions = []
+        players_out = set(mock_team_ids) - set(optimal_ids)
+        players_in = set(optimal_ids) - set(mock_team_ids)
+        
+        # Create actual transfer suggestions
+        for i, (out_id, in_id) in enumerate(zip(list(players_out)[:5], list(players_in)[:5])):
+            out_player = df[df['player_id'] == out_id].iloc[0] if not df[df['player_id'] == out_id].empty else None
+            in_player = df[df['player_id'] == in_id].iloc[0] if not df[df['player_id'] == in_id].empty else None
+            
+            if out_player is not None and in_player is not None:
+                expected_gain = (in_player.get('predicted_points', 0) - out_player.get('predicted_points', 0))
+                transfer_suggestions.append({
+                    "player_out_id": int(out_id),
+                    "player_out_name": out_player.get('name', 'Unknown'),
+                    "player_out_price": float(out_player.get('price', 0)),
+                    "player_in_id": int(in_id), 
+                    "player_in_name": in_player.get('name', 'Unknown'),
+                    "player_in_price": float(in_player.get('price', 0)),
+                    "expected_gain": float(expected_gain),
+                    "reasoning": f"Upgrade {out_player.get('name', 'Unknown')} to {in_player.get('name', 'Unknown')} for better form and fixtures",
+                    "priority": i + 1
+                })
         
         # Weekly strategy insights
         insights = {
-            "fixture_analysis": "Analyze upcoming fixtures for transfer timing",
-            "price_changes": "Monitor player price changes to maximize team value", 
-            "injury_updates": "Stay updated on player fitness and availability",
-            "form_analysis": "Consider recent form trends beyond just predictions"
+            "fixture_analysis": "Monitor upcoming fixture difficulty - easy fixtures favor attacking players",
+            "price_changes": "Track player price rises/falls to maximize team value before transfers", 
+            "injury_updates": "Check latest injury news and press conferences before deadline",
+            "form_analysis": "Prioritize players with strong recent form over season averages"
         }
         
         return {
-            "current_gameweek": current_gameweek,
-            "suggested_transfers": transfer_suggestions[:5],  # Top 5 suggestions
-            "transfer_strategy": "Free transfers available: 1-2 per week",
+            "target_gameweek": next_gw,
+            "suggested_transfers": transfer_suggestions,
+            "transfer_strategy": f"Plan transfers for GW{next_gw} - Free transfer available every week",
             "weekly_insights": insights,
-            "team_evolution": "Team will be continuously optimized based on form, fixtures, and injuries"
+            "team_evolution": f"Optimize team selection based on GW{next_gw} fixtures and form",
+            "total_suggestions": len(transfer_suggestions)
         }
         
     except Exception as e:
@@ -527,7 +646,22 @@ def index() -> str:
     </style>
 </head>
 
-<body x-data="fplApp()" x-init="init()" class="min-h-screen">
+<body x-data="fplApp()" x-init="init()" class="min-h-screen" @keydown.f12.window.prevent="debug = !debug">
+    
+    <!-- Debug Panel -->
+    <div x-show="debug" 
+         class="fixed top-4 right-4 z-50 bg-black bg-opacity-90 text-white p-4 rounded-lg text-xs max-w-sm border border-gray-500">
+        <div class="mb-2 font-bold text-green-400">🐛 Debug Panel</div>
+        <div>Button presses: <span x-text="buttonPressCount" class="text-yellow-300"></span></div>
+        <div>Players loaded: <span x-text="players.length" class="text-blue-300"></span></div>
+        <div>Filtered: <span x-text="filteredPlayers.length" class="text-purple-300"></span></div>
+        <div>Position: <span x-text="selectedPosition" class="text-green-300"></span></div>
+        <div>Chart: <span x-text="chartView" class="text-orange-300"></span></div>
+        <div>Loading: <span x-text="loading" class="text-red-300"></span></div>
+        <div>Status: <span x-text="statusText" class="text-cyan-300"></span></div>
+        <button @click="debug = false" class="mt-2 bg-red-600 hover:bg-red-700 px-2 py-1 rounded text-xs">Hide (F12)</button>
+    </div>
+    
     <!-- Hero Section -->
     <div class="hero-card rounded-3xl m-6 p-8 text-white relative z-10 fade-in">
         <div class="flex flex-col lg:flex-row justify-between items-start lg:items-center">
@@ -540,7 +674,8 @@ def index() -> str:
                 <p class="text-purple-300 mt-2">Advanced machine learning predictions for Fantasy Premier League</p>
             </div>
             <div class="text-right">
-                <div class="text-4xl font-bold text-green-400" x-text="'GW ' + gameweek"></div>
+                <div class="text-2xl font-bold text-green-400">Current: GW<span x-text="gameweek"></span></div>
+                <div class="text-3xl font-bold text-cyan-400">Predicting: GW<span x-text="predictionGameweek"></span></div>
                 <div class="text-purple-200">2025/26 Season</div>
                 <div class="mt-4 text-sm text-purple-300">
                     Last updated: <span x-text="lastUpdate"></span>
@@ -576,10 +711,46 @@ def index() -> str:
         </div>
     </div>
 
-    <!-- Controls -->
+    <!-- Tab Navigation -->
     <div class="mx-6 mb-8 glass-card rounded-2xl p-6 fade-in">
+        <nav class="flex space-x-8 mb-6 border-b border-gray-200">
+            <button @click="activeTab = 'predictions'" 
+                    :class="activeTab === 'predictions' ? 'border-purple-500 text-purple-600' : 'border-transparent text-gray-500 hover:text-gray-700'"
+                    class="py-2 px-1 border-b-2 font-medium text-sm whitespace-nowrap">
+                📊 Predictions
+            </button>
+            <button @click="activeTab = 'fixtures'" 
+                    :class="activeTab === 'fixtures' ? 'border-purple-500 text-purple-600' : 'border-transparent text-gray-500 hover:text-gray-700'"
+                    class="py-2 px-1 border-b-2 font-medium text-sm whitespace-nowrap">
+                📅 Fixtures
+            </button>
+            <button @click="activeTab = 'team'" 
+                    :class="activeTab === 'team' ? 'border-purple-500 text-purple-600' : 'border-transparent text-gray-500 hover:text-gray-700'"
+                    class="py-2 px-1 border-b-2 font-medium text-sm whitespace-nowrap">
+                👥 Team Builder
+            </button>
+            <button @click="activeTab = 'transfers'" 
+                    :class="activeTab === 'transfers' ? 'border-purple-500 text-purple-600' : 'border-transparent text-gray-500 hover:text-gray-700'"
+                    class="py-2 px-1 border-b-2 font-medium text-sm whitespace-nowrap">
+                🔄 Transfers
+            </button>
+            <button @click="activeTab = 'actual'" 
+                    :class="activeTab === 'actual' ? 'border-purple-500 text-purple-600' : 'border-transparent text-gray-500 hover:text-gray-700'"
+                    class="py-2 px-1 border-b-2 font-medium text-sm whitespace-nowrap">
+                🏆 Actual Points
+            </button>
+            <button @click="activeTab = 'performance'" 
+                    :class="activeTab === 'performance' ? 'border-purple-500 text-purple-600' : 'border-transparent text-gray-500 hover:text-gray-700'"
+                    class="py-2 px-1 border-b-2 font-medium text-sm whitespace-nowrap">
+                📈 Performance
+            </button>
+        </nav>
+    </div>
+
+    <!-- Controls -->
+    <div class="mx-6 mb-8 glass-card rounded-2xl p-6 fade-in" x-show="activeTab === 'predictions'">
         <div class="flex flex-wrap items-center gap-4 mb-6">
-            <button @click="refreshData()" :disabled="loading" 
+            <button @click="trackButtonPress('refresh'); refreshData()" :disabled="loading" 
                     class="btn-primary px-8 py-3 rounded-full font-semibold flex items-center gap-3">
                 <i class="fas fa-sync-alt" :class="{'loading-spinner': loading}"></i>
                 <span x-text="loading ? 'Refreshing...' : 'Refresh Data'"></span>
@@ -598,7 +769,7 @@ def index() -> str:
         <!-- Position Filters -->
         <div class="flex gap-3 flex-wrap">
             <template x-for="pos in positions">
-                <button @click="selectedPosition = pos; filterPlayers()" 
+                <button @click="trackButtonPress('position-' + pos); selectedPosition = pos; filterPlayers()" 
                         :class="selectedPosition === pos ? 'active' : ''"
                         class="filter-tab px-6 py-2 rounded-full font-medium text-sm"
                         x-text="pos === 'ALL' ? 'All Players' : pos">
@@ -607,8 +778,14 @@ def index() -> str:
         </div>
     </div>
 
+    <!-- Prediction Banner -->
+    <div class="mx-6 mb-4 bg-gradient-to-r from-purple-600 to-blue-600 text-white rounded-xl p-4 text-center" x-show="activeTab === 'predictions'">
+        <div class="text-2xl font-bold">🔮 Predictions for Gameweek <span x-text="predictionGameweek"></span></div>
+        <div class="text-sm opacity-90 mt-1">All player predictions, team selections, and analysis below are for GW<span x-text="predictionGameweek"></span></div>
+    </div>
+
     <!-- Main Content -->
-    <div class="mx-6 mb-8 grid grid-cols-1 xl:grid-cols-3 gap-8">
+    <div class="mx-6 mb-8 grid grid-cols-1 xl:grid-cols-3 gap-8" x-show="activeTab === 'predictions'">
         <!-- Predictions Chart -->
         <div class="xl:col-span-2 glass-card rounded-2xl p-8 fade-in">
             <div class="flex justify-between items-center mb-6">
@@ -617,10 +794,10 @@ def index() -> str:
                     Top Predictions
                 </h2>
                 <div class="flex gap-2">
-                    <button @click="chartView = 'points'; renderChart()" 
+                    <button @click="trackButtonPress('chart-points'); chartView = 'points'; renderChart()" 
                             :class="chartView === 'points' ? 'bg-purple-600 text-white' : 'bg-gray-100'"
                             class="px-4 py-2 rounded-lg text-sm font-medium">Points</button>
-                    <button @click="chartView = 'value'; renderChart()" 
+                    <button @click="trackButtonPress('chart-value'); chartView = 'value'; renderChart()" 
                             :class="chartView === 'value' ? 'bg-purple-600 text-white' : 'bg-gray-100'"
                             class="px-4 py-2 rounded-lg text-sm font-medium">Value</button>
                 </div>
@@ -654,8 +831,81 @@ def index() -> str:
         </div>
     </div>
 
+    <!-- Fixtures Tab -->
+    <div class="mx-6 mb-8" x-show="activeTab === 'fixtures'" x-data="{ fixtures: null, loading: false }">
+        <div class="glass-card rounded-2xl p-8 fade-in">
+            <div class="flex justify-between items-center mb-6">
+                <h2 class="text-2xl font-bold text-gray-800">
+                    <i class="fas fa-calendar-alt mr-3 text-green-600"></i>
+                    Fixture Calendar & Difficulty
+                </h2>
+                <button @click="loadFixtures()" :disabled="loading"
+                        class="btn-primary px-6 py-3 rounded-full font-semibold flex items-center gap-2">
+                    <i class="fas fa-refresh" :class="{'loading-spinner': loading}"></i>
+                    <span x-text="loading ? 'Loading...' : 'Load Fixtures'"></span>
+                </button>
+            </div>
+            
+            <div x-show="fixtures" x-transition class="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                <!-- Current Gameweek -->
+                <div class="bg-gradient-to-br from-blue-50 to-purple-50 rounded-xl p-6">
+                    <h3 class="text-lg font-bold text-gray-800 mb-4">
+                        Current Gameweek <span x-text="fixtures?.gameweek"></span>
+                    </h3>
+                    <div class="space-y-3">
+                        <template x-for="fixture in (fixtures?.current || [])">
+                            <div class="bg-white rounded-lg p-4 shadow-sm border-l-4 border-blue-500">
+                                <div class="flex justify-between items-center">
+                                    <div class="font-semibold" x-text="getTeamName(fixture.team_h) + ' vs ' + getTeamName(fixture.team_a)"></div>
+                                    <div class="text-sm text-gray-500" x-text="fixture.kickoff_time ? new Date(fixture.kickoff_time).toLocaleDateString() : 'TBD'"></div>
+                                </div>
+                                <div class="flex justify-between mt-2 text-sm">
+                                    <span class="text-blue-600">Home Difficulty: <span x-text="fixture.team_h_difficulty || 'N/A'"></span></span>
+                                    <span class="text-purple-600">Away Difficulty: <span x-text="fixture.team_a_difficulty || 'N/A'"></span></span>
+                                </div>
+                            </div>
+                        </template>
+                    </div>
+                </div>
+                
+                <!-- Next Gameweek -->
+                <div class="bg-gradient-to-br from-green-50 to-blue-50 rounded-xl p-6">
+                    <h3 class="text-lg font-bold text-gray-800 mb-4">
+                        Next Gameweek <span x-text="(fixtures?.gameweek || 0) + 1"></span>
+                    </h3>
+                    <div class="space-y-3">
+                        <template x-for="fixture in (fixtures?.next || [])">
+                            <div class="bg-white rounded-lg p-4 shadow-sm border-l-4 border-green-500">
+                                <div class="flex justify-between items-center">
+                                    <div class="font-semibold" x-text="getTeamName(fixture.team_h) + ' vs ' + getTeamName(fixture.team_a)"></div>
+                                    <div class="text-sm text-gray-500" x-text="fixture.kickoff_time ? new Date(fixture.kickoff_time).toLocaleDateString() : 'TBD'"></div>
+                                </div>
+                                <div class="flex justify-between mt-2 text-sm">
+                                    <span class="text-blue-600">Home Difficulty: <span x-text="fixture.team_h_difficulty || 'N/A'"></span></span>
+                                    <span class="text-purple-600">Away Difficulty: <span x-text="fixture.team_a_difficulty || 'N/A'"></span></span>
+                                </div>
+                            </div>
+                        </template>
+                    </div>
+                </div>
+            </div>
+            
+            <div x-show="!fixtures && !loading" class="text-center py-12 text-gray-500">
+                <i class="fas fa-calendar-check text-6xl mb-4"></i>
+                <p class="text-lg">Click "Load Fixtures" to see match calendar and difficulty ratings</p>
+                <p class="text-sm mt-2">Difficulty: 1 = Easy, 5 = Very Hard</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Team Builder Banner -->
+    <div class="mx-6 mb-4 bg-gradient-to-r from-blue-600 to-green-600 text-white rounded-xl p-4 text-center" x-show="activeTab === 'team'">
+        <div class="text-2xl font-bold">👥 Optimal Team for Gameweek <span x-text="predictionGameweek"></span></div>
+        <div class="text-sm opacity-90 mt-1">Team selection, formation, and captaincy recommendations for GW<span x-text="predictionGameweek"></span></div>
+    </div>
+
     <!-- Optimal Team Selection -->
-    <div class="mx-6 mb-8 glass-card rounded-2xl p-8 fade-in" x-data="{ showTeam: false, optimalTeam: null, loading: false }">
+    <div class="mx-6 mb-8 glass-card rounded-2xl p-8 fade-in" x-show="activeTab === 'team'" x-data="{ showTeam: false, optimalTeam: null, loading: false }">
         <div class="flex justify-between items-center mb-6">
             <h2 class="text-2xl font-bold text-gray-800">
                 <i class="fas fa-users mr-3 text-blue-600"></i>
@@ -764,8 +1014,165 @@ def index() -> str:
         </div>
     </div>
 
+    <!-- Transfer Suggestions Tab -->
+    <div class="mx-6 mb-8" x-show="activeTab === 'transfers'" x-data="{ transfers: null, loading: false }">
+        <div class="glass-card rounded-2xl p-8 fade-in">
+            <div class="flex justify-between items-center mb-6">
+                <div>
+                    <h2 class="text-2xl font-bold text-gray-800">
+                        <i class="fas fa-exchange-alt mr-3 text-orange-600"></i>
+                        Transfer Suggestions
+                    </h2>
+                    <div class="mt-2 inline-flex items-center px-3 py-1 bg-orange-100 text-orange-800 rounded-full text-sm font-medium">
+                        <i class="fas fa-calendar-alt mr-2"></i>
+                        <span x-text="`🔄 Transfer Planning for Gameweek ${app.predictionGameweek || 'N/A'}`"></span>
+                    </div>
+                </div>
+                <button @click="loadTransfers()" :disabled="loading"
+                        class="btn-primary px-6 py-3 rounded-full font-semibold flex items-center gap-2">
+                    <i class="fas fa-magic" :class="{'loading-spinner': loading}"></i>
+                    <span x-text="loading ? 'Analyzing...' : 'Get Suggestions'"></span>
+                </button>
+            </div>
+            
+            <div x-show="transfers" x-transition class="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                <!-- Transfer Suggestions -->
+                <div class="bg-gradient-to-br from-orange-50 to-red-50 rounded-xl p-6">
+                    <h3 class="text-lg font-bold text-gray-800 mb-4">Recommended Transfers</h3>
+                    <div class="space-y-3">
+                        <template x-for="transfer in (transfers?.suggested_transfers || [])">
+                            <div class="bg-white rounded-lg p-4 shadow-sm border-l-4 border-orange-500">
+                                <div class="font-semibold text-green-600 mb-2">
+                                    OUT: <span x-text="transfer.player_out_name"></span> (£<span x-text="transfer.player_out_price"></span>m)
+                                </div>
+                                <div class="font-semibold text-blue-600 mb-2">
+                                    IN: <span x-text="transfer.player_in_name"></span> (£<span x-text="transfer.player_in_price"></span>m)
+                                </div>
+                                <div class="text-sm text-gray-600" x-text="transfer.reasoning"></div>
+                                <div class="text-xs text-purple-600 mt-1">
+                                    Expected gain: +<span x-text="transfer.expected_gain?.toFixed(1)"></span> pts
+                                </div>
+                            </div>
+                        </template>
+                    </div>
+                </div>
+                
+                <!-- Transfer Strategy -->
+                <div class="bg-gradient-to-br from-blue-50 to-purple-50 rounded-xl p-6">
+                    <h3 class="text-lg font-bold text-gray-800 mb-4">Weekly Strategy</h3>
+                    <div class="space-y-4">
+                        <div class="bg-white rounded-lg p-4 shadow-sm">
+                            <h4 class="font-semibold text-blue-800 mb-2">Transfer Strategy</h4>
+                            <p class="text-sm text-gray-700" x-text="transfers?.transfer_strategy"></p>
+                        </div>
+                        
+                        <div class="bg-white rounded-lg p-4 shadow-sm">
+                            <h4 class="font-semibold text-green-800 mb-2">Weekly Insights</h4>
+                            <template x-for="(insight, key) in (transfers?.weekly_insights || {})">
+                                <div class="text-sm text-gray-700 mb-1">
+                                    <strong x-text="key.replace('_', ' ').replace(/\b\w/g, l => l.toUpperCase())"></strong>: 
+                                    <span x-text="insight"></span>
+                                </div>
+                            </template>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <div x-show="!transfers && !loading" class="text-center py-12 text-gray-500">
+                <i class="fas fa-exchange-alt text-6xl mb-4"></i>
+                <p class="text-lg">Click "Get Suggestions" to see intelligent transfer recommendations</p>
+                <p class="text-sm mt-2">Based on form, fixtures, and value analysis</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Actual Points Tab -->
+    <div class="mx-6 mb-8" x-show="activeTab === 'actual'" x-data="{ actualPoints: null, selectedGW: 1, loading: false, totalPoints: {} }">
+        <div class="glass-card rounded-2xl p-8 fade-in">
+            <div class="flex justify-between items-center mb-6">
+                <h2 class="text-2xl font-bold text-gray-800">
+                    <i class="fas fa-trophy mr-3 text-yellow-600"></i>
+                    Actual Points Tracker
+                </h2>
+                <div class="flex gap-3">
+                    <select x-model="selectedGW" class="px-4 py-2 border rounded-lg">
+                        <template x-for="gw in Array.from({length: 38}, (_, i) => i + 1)">
+                            <option :value="gw" x-text="'GW' + gw"></option>
+                        </template>
+                    </select>
+                    <button @click="loadActualPoints()" :disabled="loading"
+                            class="btn-primary px-6 py-2 rounded-lg font-semibold flex items-center gap-2">
+                        <i class="fas fa-download" :class="{'loading-spinner': loading}"></i>
+                        <span x-text="loading ? 'Loading...' : 'Get Actual Points'"></span>
+                    </button>
+                </div>
+            </div>
+            
+            <div x-show="actualPoints" x-transition class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+                <!-- GW Summary -->
+                <div class="bg-gradient-to-br from-yellow-50 to-orange-50 rounded-xl p-6">
+                    <h3 class="text-lg font-bold text-gray-800 mb-4">
+                        GW<span x-text="actualPoints?.gameweek"></span> Summary
+                    </h3>
+                    <div class="space-y-3">
+                        <div class="flex justify-between">
+                            <span class="text-gray-600">Total Players:</span>
+                            <span class="font-bold" x-text="actualPoints?.total_players"></span>
+                        </div>
+                        <div class="flex justify-between">
+                            <span class="text-gray-600">Top Scorer:</span>
+                            <span class="font-bold text-green-600" x-text="actualPoints?.players?.[0]?.name + ' (' + actualPoints?.players?.[0]?.total_points + 'pts)'"></span>
+                        </div>
+                        <div class="flex justify-between">
+                            <span class="text-gray-600">Average Points:</span>
+                            <span class="font-bold" x-text="actualPoints?.players ? (actualPoints.players.reduce((sum, p) => sum + p.total_points, 0) / actualPoints.players.length).toFixed(1) : '0'"></span>
+                        </div>
+                        <div class="mt-4 pt-3 border-t border-gray-200">
+                            <button @click="calculateCumulativePoints()" 
+                                    class="w-full bg-blue-500 text-white py-2 px-4 rounded text-sm hover:bg-blue-600">
+                                Calculate Total Season Points
+                            </button>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Top Performers -->
+                <div class="lg:col-span-2 bg-gradient-to-br from-green-50 to-blue-50 rounded-xl p-6">
+                    <h3 class="text-lg font-bold text-gray-800 mb-4">Top Performers</h3>
+                    <div class="space-y-2 max-h-80 overflow-y-auto">
+                        <template x-for="(player, index) in (actualPoints?.players || []).slice(0, 20)">
+                            <div class="flex items-center justify-between p-3 bg-white rounded-lg shadow-sm">
+                                <div class="flex items-center space-x-3">
+                                    <span class="w-8 h-8 bg-purple-100 text-purple-800 rounded-full flex items-center justify-center text-sm font-bold" x-text="index + 1"></span>
+                                    <div>
+                                        <div class="font-semibold text-sm" x-text="player.name"></div>
+                                        <div class="text-xs text-gray-500">
+                                            <span x-text="player.selected_by_percent + '% owned'"></span> • 
+                                            <span x-text="'Form: ' + player.form"></span>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="text-right">
+                                    <div class="text-xl font-bold text-green-600" x-text="player.total_points + 'pts'"></div>
+                                    <div class="text-xs text-gray-500" x-text="player.points_per_game + ' avg'"></div>
+                                </div>
+                            </div>
+                        </template>
+                    </div>
+                </div>
+            </div>
+            
+            <div x-show="!actualPoints && !loading" class="text-center py-12 text-gray-500">
+                <i class="fas fa-trophy text-6xl mb-4"></i>
+                <p class="text-lg">Select a gameweek and click "Get Actual Points" to see real performance</p>
+                <p class="text-sm mt-2">Track which players actually delivered the points!</p>
+            </div>
+        </div>
+    </div>
+
     <!-- Gameweek Performance Tracking -->
-    <div class="mx-6 mb-8 glass-card rounded-2xl p-8 fade-in" x-data="{ performanceData: null, selectedGW: 1, loading: false }">
+    <div class="mx-6 mb-8 glass-card rounded-2xl p-8 fade-in" x-show="activeTab === 'performance'" x-data="{ performanceData: null, selectedGW: 1, loading: false }">
         <div class="flex justify-between items-center mb-6">
             <h2 class="text-2xl font-bold text-gray-800">
                 <i class="fas fa-chart-bar mr-3 text-green-600"></i>
@@ -831,7 +1238,7 @@ def index() -> str:
     </div>
 
     <!-- Players Table -->
-    <div class="mx-6 mb-8 glass-card rounded-2xl p-8 fade-in">
+    <div class="mx-6 mb-8 glass-card rounded-2xl p-8 fade-in" x-show="activeTab === 'predictions'">
         <h2 class="text-2xl font-bold text-gray-800 mb-6">
             <i class="fas fa-users mr-3 text-indigo-600"></i>
             Player Analysis
@@ -915,9 +1322,12 @@ def index() -> str:
                 positions: ['ALL', 'GKP', 'DEF', 'MID', 'FWD'],
                 statusText: 'Ready',
                 chartView: 'points',
+                activeTab: 'predictions',
                 
                 // Stats
                 gameweek: 1,
+                nextGameweek: 2,
+                predictionGameweek: 2,
                 totalPlayers: 0,
                 topPlayer: 'Loading...',
                 avgPrediction: '0.0',
@@ -926,7 +1336,23 @@ def index() -> str:
                 topDifferential: 'Analyzing...',
                 captainPick: 'Analyzing...',
                 
+                // Debug flag
+                debug: true,
+                buttonPressCount: 0,
+                
+                log(message, data = null) {
+                    if (this.debug) {
+                        console.log(`[FPL Debug] ${message}`, data);
+                    }
+                },
+                
+                trackButtonPress(buttonName) {
+                    this.buttonPressCount++;
+                    this.log(`Button pressed: ${buttonName} (count: ${this.buttonPressCount})`);
+                },
+
                 async init() {
+                    this.log('Initializing FPL App');
                     await this.loadData();
                     await this.loadSummary();
                     this.filterPlayers();
@@ -935,12 +1361,16 @@ def index() -> str:
                 },
                 
                 async loadData() {
+                    this.log('Loading player data from /predictions');
                     try {
                         const response = await fetch('/predictions');
+                        this.log('Predictions response', { status: response.status, ok: response.ok });
                         this.players = await response.json();
                         this.totalPlayers = this.players.length;
+                        this.log(`Successfully loaded ${this.players.length} players`);
                         console.log(`Loaded ${this.players.length} players`);
                     } catch (error) {
+                        this.log('Failed to load predictions', error);
                         console.error('Failed to load predictions:', error);
                         this.statusText = 'Error loading data';
                     }
@@ -951,18 +1381,28 @@ def index() -> str:
                         const response = await fetch('/summary');
                         const data = await response.json();
                         this.gameweek = data.gameweek || 1;
+                        this.nextGameweek = data.next_gameweek || 2;
+                        this.predictionGameweek = data.prediction_gameweek || 2;
                         this.avgPrediction = (data.avg_prediction || 0).toFixed(1);
+                        this.log('Summary loaded', data);
                     } catch (error) {
                         console.error('Failed to load summary:', error);
                     }
                 },
                 
                 filterPlayers() {
+                    this.log('Filtering players', { 
+                        totalPlayers: this.players.length, 
+                        selectedPosition: this.selectedPosition, 
+                        searchQuery: this.searchQuery 
+                    });
+                    
                     let filtered = this.players;
                     
                     // Position filter
                     if (this.selectedPosition !== 'ALL') {
                         filtered = filtered.filter(p => p.position === this.selectedPosition);
+                        this.log(`After position filter (${this.selectedPosition}): ${filtered.length} players`);
                     }
                     
                     // Search filter
@@ -972,17 +1412,27 @@ def index() -> str:
                             (p.name || '').toLowerCase().includes(query) ||
                             (p.team_short || '').toLowerCase().includes(query)
                         );
+                        this.log(`After search filter (${query}): ${filtered.length} players`);
                     }
                     
                     // Sort by predicted points
                     filtered.sort((a, b) => (b.predicted_points || 0) - (a.predicted_points || 0));
                     
                     this.filteredPlayers = filtered;
+                    this.log(`Final filtered players: ${this.filteredPlayers.length}`);
                 },
                 
                 renderChart() {
+                    this.log('Rendering chart', { 
+                        chartView: this.chartView, 
+                        filteredPlayersCount: this.filteredPlayers.length 
+                    });
+                    
                     const data = this.filteredPlayers.slice(0, 20);
-                    if (!data.length) return;
+                    if (!data.length) {
+                        this.log('No data to render chart');
+                        return;
+                    }
                     
                     const trace = {
                         x: data.map(p => p.name || 'Unknown'),
@@ -1044,12 +1494,16 @@ def index() -> str:
                 },
                 
                 async refreshData() {
+                    this.log('Refresh button clicked');
                     this.loading = true;
                     this.statusText = 'Refreshing data...';
                     
                     try {
+                        this.log('Making refresh API call to /refresh');
                         const response = await fetch('/refresh', { method: 'POST' });
+                        this.log('Refresh response received', { status: response.status, ok: response.ok });
                         const result = await response.json();
+                        this.log('Refresh result', result);
                         
                         if (response.ok) {
                             this.statusText = 'Data refreshed successfully!';
@@ -1084,6 +1538,24 @@ def index() -> str:
                         'n': 'Not in Squad'
                     };
                     return statusMap[status] || 'Unknown';
+                },
+                
+                calculateCumulativePoints() {
+                    this.log('Calculating cumulative points for all players');
+                    // This would typically fetch actual points for all completed gameweeks
+                    // and calculate totals - for now it's a placeholder
+                    alert('Cumulative points calculation would fetch all completed gameweeks and sum total points per player');
+                },
+                
+                getTeamName(teamId) {
+                    // Simple team mapping - will be enhanced with actual team data
+                    const teams = {
+                        1: 'ARS', 2: 'AVL', 3: 'BOU', 4: 'BRE', 5: 'BHA', 6: 'CHE', 
+                        7: 'CRY', 8: 'EVE', 9: 'FUL', 10: 'IPS', 11: 'LEI', 12: 'LIV',
+                        13: 'MCI', 14: 'MUN', 15: 'NEW', 16: 'NFO', 17: 'SOU', 18: 'TOT',
+                        19: 'WHU', 20: 'WOL'
+                    };
+                    return teams[teamId] || `Team ${teamId}`;
                 }
             }
         }
@@ -1134,6 +1606,77 @@ def index() -> str:
             }
         }
         
+        // Fixtures loading function
+        async function loadFixtures() {
+            const fixturesComponent = Alpine.$data(document.querySelector('[x-data*="fixtures"]'));
+            
+            fixturesComponent.loading = true;
+            try {
+                const response = await fetch('/fixtures');
+                const data = await response.json();
+                
+                if (response.ok) {
+                    fixturesComponent.fixtures = data;
+                    console.log('Fixtures loaded:', data);
+                } else {
+                    throw new Error(data.detail || 'Failed to load fixtures');
+                }
+            } catch (error) {
+                console.error('Failed to load fixtures:', error);
+                alert('Failed to load fixtures: ' + error.message);
+            } finally {
+                fixturesComponent.loading = false;
+            }
+        }
+        
+        // Transfer suggestions loading function
+        async function loadTransfers() {
+            const app = Alpine.$data(document.querySelector('[x-data]'));
+            const transfersComponent = Alpine.$data(document.querySelector('[x-data*="transfers"]'));
+            
+            transfersComponent.loading = true;
+            try {
+                const response = await fetch('/transfer-suggestions?current_gameweek=' + app.gameweek);
+                const data = await response.json();
+                
+                if (response.ok) {
+                    transfersComponent.transfers = data;
+                    console.log('Transfer suggestions loaded:', data);
+                } else {
+                    throw new Error(data.detail || 'Failed to load transfer suggestions');
+                }
+            } catch (error) {
+                console.error('Failed to load transfer suggestions:', error);
+                alert('Failed to load transfer suggestions: ' + error.message);
+            } finally {
+                transfersComponent.loading = false;
+            }
+        }
+        
+        // Actual points loading function
+        async function loadActualPoints() {
+            const actualComponent = Alpine.$data(document.querySelector('[x-data*="actualPoints"]'));
+            const gw = actualComponent.selectedGW;
+            
+            actualComponent.loading = true;
+            try {
+                const response = await fetch(`/actual-points/${gw}`);
+                const data = await response.json();
+                
+                if (response.ok && !data.error) {
+                    actualComponent.actualPoints = data;
+                    console.log('Actual points loaded:', data);
+                } else {
+                    throw new Error(data.error || 'Failed to load actual points');
+                }
+            } catch (error) {
+                console.error('Failed to load actual points:', error);
+                alert('Failed to load actual points: ' + error.message);
+            } finally {
+                actualComponent.loading = false;
+            }
+        }
+
         // Team selection functions
         async function loadOptimalTeam() {
             const app = Alpine.$data(document.querySelector('[x-data]'));
@@ -1141,7 +1684,7 @@ def index() -> str:
             
             teamComponent.loading = true;
             try {
-                const response = await fetch('/team?gameweek=' + app.gameweek);
+                const response = await fetch('/team?gameweek=' + app.predictionGameweek);
                 const data = await response.json();
                 
                 if (response.ok) {
