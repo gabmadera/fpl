@@ -3,6 +3,8 @@ from __future__ import annotations
 import pandas as pd
 import numpy as np
 from typing import Optional
+from .position_specific_features import PositionSpecificFeatureEngineer
+from .enhanced_fixture_analyzer import EnhancedFixtureAnalyzer
 
 
 class FeatureEngineer:
@@ -10,6 +12,8 @@ class FeatureEngineer:
         self.lookback_windows = [3, 5, 8, 12, 20]
         self.form_windows = [3, 5, 10]
         self.difficulty_weights = {'easy': 1.2, 'medium': 1.0, 'hard': 0.8}
+        self.position_engineer = PositionSpecificFeatureEngineer()
+        self.enhanced_fixture_analyzer = EnhancedFixtureAnalyzer()
 
     def create_features(self, player_data: pd.DataFrame, fixture_data: pd.DataFrame) -> pd.DataFrame:
         df = player_data.copy()
@@ -22,12 +26,14 @@ class FeatureEngineer:
         # Advanced form features
         df = self._create_form_features(df)
         
-        # Position-specific features
+        # Enhanced position-specific features
         df = self._create_position_features(df)
+        df = self.position_engineer.engineer_position_features(df)
         
         # Enhanced fixture analysis
         if not fixture_data.empty and "team_id" in df.columns:
             df = self._create_fixture_features(df, fixture_data)
+            df = self._create_enhanced_fixture_features(df)
         else:
             df["opp_difficulty"] = 3
             df["fixture_strength"] = 1.0
@@ -126,6 +132,51 @@ class FeatureEngineer:
             df['home_advantage'] = 1.0
         
         return df
+    
+    def _create_enhanced_fixture_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Add position-specific enhanced fixture features"""
+        try:
+            # Get enhanced fixture analysis
+            enhanced_fixtures = self.enhanced_fixture_analyzer.analyze_enhanced_fixtures(gameweeks=5)
+            
+            if 'error' in enhanced_fixtures:
+                return df
+            
+            # Add position-specific fixture difficulties
+            for position in ['GKP', 'DEF', 'MID', 'FWD']:
+                position_mask = df['position'] == position
+                if position_mask.sum() == 0:
+                    continue
+                
+                # Default values
+                df.loc[position_mask, f'{position.lower()}_fixture_difficulty'] = 3
+                df.loc[position_mask, f'{position.lower()}_clean_sheet_prob'] = 0.3
+                df.loc[position_mask, f'{position.lower()}_expected_goals'] = 1.5
+            
+            # Try to map team difficulties to players
+            if 'team_id' in df.columns:
+                for gw_data in enhanced_fixtures.values():
+                    if isinstance(gw_data, dict):
+                        for team_id, team_fixtures in gw_data.items():
+                            if isinstance(team_fixtures, dict) and 'difficulties' in team_fixtures:
+                                team_mask = df['team_id'] == team_id
+                                
+                                for position, difficulty in team_fixtures['difficulties'].items():
+                                    pos_mask = team_mask & (df['position'] == position)
+                                    if pos_mask.sum() > 0:
+                                        df.loc[pos_mask, f'{position.lower()}_fixture_difficulty'] = difficulty
+                                        
+                                        if 'clean_sheet_probability' in team_fixtures:
+                                            df.loc[pos_mask, f'{position.lower()}_clean_sheet_prob'] = team_fixtures['clean_sheet_probability']
+                                        
+                                        if 'expected_goals' in team_fixtures:
+                                            df.loc[pos_mask, f'{position.lower()}_expected_goals'] = team_fixtures['expected_goals']
+            
+            return df
+            
+        except Exception as e:
+            # Fallback: return original df if enhanced fixture analysis fails
+            return df
     
     def _create_value_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """Create value-based features for optimization"""
