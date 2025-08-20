@@ -288,6 +288,38 @@ def cache_status() -> dict:
     except Exception as e:
         return {"error": str(e)}
 
+@app.get("/fixtures")
+def fixtures() -> dict:
+    """Return fixtures grouped by gameweek with difficulty and team names."""
+    try:
+        fpl = FPLClient()
+        fx = fpl.fixtures() or []
+        teams = {t["id"]: t for t in (fpl.bootstrap_static().get("teams", []) or [])}
+        # Group fixtures by event
+        by_gw: dict[int, list] = {}
+        for f in fx:
+            ev = f.get("event")
+            if ev is None:
+                continue
+            ev = int(ev)
+            th, ta = int(f.get("team_h")), int(f.get("team_a"))
+            rec = {
+                "home_id": th,
+                "away_id": ta,
+                "home": teams.get(th, {}).get("short_name") or teams.get(th, {}).get("name"),
+                "away": teams.get(ta, {}).get("short_name") or teams.get(ta, {}).get("name"),
+                "home_fdr": f.get("team_h_difficulty"),
+                "away_fdr": f.get("team_a_difficulty"),
+                "kickoff_time": f.get("kickoff_time")
+            }
+            by_gw.setdefault(ev, []).append(rec)
+        # Sort fixtures inside each GW
+        for ev in by_gw:
+            by_gw[ev] = sorted(by_gw[ev], key=lambda r: (r.get("kickoff_time") or ""))
+        return {"status": "success", "fixtures": by_gw}
+    except Exception as e:
+        return {"error": str(e)}
+
 @app.get("/", response_class=HTMLResponse)
 def index() -> str:
     return """
@@ -395,6 +427,15 @@ def index() -> str:
             <button onclick="loadPredictions()" class="btn-primary">Load Predictions</button>
         </div>
         <div id="predictions-content" class="text-gray-600">Click "Load Predictions" to see current player predictions...</div>
+    </div>
+
+    <!-- Fixtures Panel -->
+    <div class="mx-6 mb-8 glass-card rounded-2xl p-6 fade-in">
+        <div class="flex justify-between items-center mb-4">
+            <h2 class="text-xl font-bold text-gray-800">🗓️ Fixtures (by Gameweek)</h2>
+            <button onclick="loadFixtures()" class="btn-primary">Load Fixtures</button>
+        </div>
+        <div id="fixtures-content" class="text-gray-600">Click "Load Fixtures" to see upcoming matches and FDR.</div>
     </div>
 
     <!-- Suggested Team Panel -->
@@ -559,6 +600,10 @@ def index() -> str:
                 };
                 const posColor = positionColors[position] || 'bg-gray-100 text-gray-800';
                 
+                const next5 = Array.isArray(player.next5_fdr_list) ? player.next5_fdr_list : [];
+                const next5avg = (player.next5_fdr_avg !== null && player.next5_fdr_avg !== undefined) ? Number(player.next5_fdr_avg).toFixed(2) : null;
+                const next5Html = next5.length ? `<div class="text-[11px] text-gray-500 mt-1">Next 5 FDR: [${next5.join(', ')}]${next5avg ? ` • avg ${next5avg}` : ''}</div>` : '';
+
                 html += `
                     <div class="bg-white rounded-lg p-3 border shadow-sm hover:shadow-md transition-shadow">
                         <div class="flex justify-between items-start mb-2">
@@ -576,6 +621,7 @@ def index() -> str:
                         </div>
                         ${chance < 100 ? `<div class="text-xs text-orange-600 font-medium mt-1">Chance: ${chance}%</div>` : ''}
                         ${(player.xg_per90 || player.xa_per90) ? `<div class="text-xs text-gray-600 mt-1">xG/90: ${(player.xg_per90||0).toFixed ? (player.xg_per90||0).toFixed(2) : player.xg_per90} • xA/90: ${(player.xa_per90||0).toFixed ? (player.xa_per90||0).toFixed(2) : player.xa_per90}</div>` : ''}
+                        ${next5Html}
                     </div>
                 `;
             });
@@ -597,6 +643,35 @@ def index() -> str:
             
             // Store players data globally for show all function
             window.allPlayersData = players;
+        }
+
+        // Load and display fixtures
+        async function loadFixtures() {
+            try {
+                const el = document.getElementById('fixtures-content');
+                el.innerHTML = '🔄 Loading fixtures...';
+                const res = await fetch('/fixtures');
+                const data = await res.json();
+                if (!res.ok || data.status !== 'success') throw new Error(data.error || 'Failed to load fixtures');
+                const fx = data.fixtures || {};
+                let html = '';
+                const gwKeys = Object.keys(fx).sort((a,b)=> Number(a)-Number(b));
+                gwKeys.forEach(gw => {
+                    html += `<div class="mb-3"><div class="font-semibold text-gray-800">GW ${gw}</div>`;
+                    html += '<div class="mt-1 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2">';
+                    (fx[gw]||[]).forEach(m => {
+                        html += `<div class="text-xs bg-white border rounded p-2">`+
+                                `<div class="font-medium text-gray-700">${m.home} vs ${m.away}</div>`+
+                                `<div class="text-gray-500">FDR: H ${m.home_fdr ?? '-'} / A ${m.away_fdr ?? '-'}</div>`+
+                                `${m.kickoff_time ? `<div class=\"text-gray-400\">${m.kickoff_time}</div>` : ''}`+
+                                `</div>`;
+                    });
+                    html += '</div></div>';
+                });
+                el.innerHTML = html || 'No fixtures found.';
+            } catch (e) {
+                document.getElementById('fixtures-content').innerHTML = '❌ Failed to load fixtures';
+            }
         }
         
         function showAllPredictions() {
