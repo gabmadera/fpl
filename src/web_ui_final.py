@@ -540,6 +540,9 @@ def index() -> str:
                 
                 // Use team_name if available, otherwise fall back to team_short
                 const teamName = player.team_name || player.team_short || 'Unknown Team';
+                const opp = player.next_opponent_short || player.next_opponent || '';
+                const ha = player.next_is_home || '';
+                const fdr = (player.next_fdr !== null && player.next_fdr !== undefined) ? `FDR ${player.next_fdr}` : '';
                 
                 // Get additional stats
                 const form = player.form || 'N/A';
@@ -562,7 +565,7 @@ def index() -> str:
                             <div class="font-bold text-gray-800 text-sm">${player.name || 'Unknown'}</div>
                             <div class="text-xs ${posColor} px-2 py-1 rounded font-medium">${position}</div>
                         </div>
-                        <div class="text-xs text-gray-600 mb-2">${teamName}</div>
+                        <div class="text-xs text-gray-600 mb-2">${teamName}${opp ? ` • ${ha}${opp}` : ''} ${fdr}</div>
                         <div class="flex justify-between items-center mb-1">
                             <span class="text-lg font-bold text-purple-600">${predictedPoints}</span>
                             <span class="text-sm text-gray-600">£${price}m</span>
@@ -572,6 +575,7 @@ def index() -> str:
                             <span>Own: ${selected}%</span>
                         </div>
                         ${chance < 100 ? `<div class="text-xs text-orange-600 font-medium mt-1">Chance: ${chance}%</div>` : ''}
+                        ${(player.xg_per90 || player.xa_per90) ? `<div class="text-xs text-gray-600 mt-1">xG/90: ${(player.xg_per90||0).toFixed ? (player.xg_per90||0).toFixed(2) : player.xg_per90} • xA/90: ${(player.xa_per90||0).toFixed ? (player.xa_per90||0).toFixed(2) : player.xa_per90}</div>` : ''}
                     </div>
                 `;
             });
@@ -630,13 +634,16 @@ def index() -> str:
                 const predictedPoints = parseFloat(player.predicted_points || 0).toFixed(1);
                 const price = parseFloat(player.now_cost || player.price || 0);
                 const teamName = player.team_name || player.team_short || 'Unknown';
+                const opp = player.next_opponent_short || player.next_opponent || '';
+                const ha = player.next_is_home || '';
+                const fdr = (player.next_fdr !== null && player.next_fdr !== undefined) ? `FDR ${player.next_fdr}` : '';
                 const form = player.form || 'N/A';
                 const selected = player.selected_by_percent || '0';
                 
                 html += `
                     <tr class="border-b hover:bg-gray-50">
                         <td class="p-2 font-medium">${player.name || 'Unknown'}</td>
-                        <td class="p-2 text-gray-600">${teamName}</td>
+                        <td class="p-2 text-gray-600">${teamName}${opp ? ` • ${ha}${opp}` : ''} ${fdr}</td>
                         <td class="p-2">${position}</td>
                         <td class="p-2 text-right font-bold text-purple-600">${predictedPoints}</td>
                         <td class="p-2 text-right">£${price}m</td>
