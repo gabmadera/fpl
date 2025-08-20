@@ -574,7 +574,7 @@ class MLPipeline:
             results['now_cost'] = 0.0
         
         # Add additional useful columns for UI
-        extra_cols = ["selected_by_percent", "form", "points_per_game", "value_form", "value_season"]
+        extra_cols = ["selected_by_percent", "form", "points_per_game", "value_form", "value_season", "total_points"]
         for col in extra_cols:
             if col in df.columns:
                 results[col] = df[col]

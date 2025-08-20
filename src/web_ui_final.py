@@ -427,7 +427,23 @@ def index() -> str:
     <div class="mx-6 mb-8 glass-card rounded-2xl p-6 fade-in">
         <div class="flex justify-between items-center mb-4">
             <h2 class="text-xl font-bold text-gray-800">📊 Current Predictions</h2>
-            <button onclick="loadPredictions()" class="btn-primary">Load Predictions</button>
+            <div class="flex items-center gap-2">
+                <select id="filter-position" class="text-sm border rounded px-2 py-1">
+                    <option value="">All Positions</option>
+                    <option value="GKP">GKP</option>
+                    <option value="DEF">DEF</option>
+                    <option value="MID">MID</option>
+                    <option value="FWD">FWD</option>
+                </select>
+                <input id="filter-team" placeholder="Team (short/name)" class="text-sm border rounded px-2 py-1" />
+                <select id="sort-by" class="text-sm border rounded px-2 py-1">
+                    <option value="predicted_points">EP (Predicted)</option>
+                    <option value="total_points">Total Points</option>
+                    <option value="xg_per90">xG/90</option>
+                    <option value="xa_per90">xA/90</option>
+                </select>
+                <button onclick="loadPredictions()" class="btn-primary">Apply</button>
+            </div>
         </div>
         <div id="predictions-content" class="text-gray-600">Click "Load Predictions" to see current player predictions...</div>
     </div>
@@ -539,7 +555,7 @@ def index() -> str:
         }
 
         // Load and display predictions
-        async function loadPredictions() {
+        async function loadPredictions(page=1, pageSize=24) {
             try {
                 updatePredictions('🔄 Loading predictions...');
                 
@@ -549,7 +565,16 @@ def index() -> str:
                 console.log('Predictions loaded:', data);
                 
                 if (response.ok && data.status === 'success') {
-                    displayPredictions(data.players, data.total_count);
+                    // Apply filters and sorting client-side
+                    const pos = document.getElementById('filter-position')?.value || '';
+                    const team = (document.getElementById('filter-team')?.value || '').toLowerCase();
+                    const sortBy = document.getElementById('sort-by')?.value || 'predicted_points';
+                    let players = data.players || [];
+                    if (pos) players = players.filter(p => (p.position || getPositionName(p.element_type || p.position_id)) === pos);
+                    if (team) players = players.filter(p => (p.team_name || p.team_short || '').toLowerCase().includes(team));
+                    const sortKey = sortBy;
+                    players.sort((a,b) => (parseFloat(b[sortKey] || 0) - parseFloat(a[sortKey] || 0)));
+                    displayPredictions(players, players.length, page, pageSize);
                 } else {
                     throw new Error(data.error || 'Failed to load predictions');
                 }
@@ -559,7 +584,7 @@ def index() -> str:
             }
         }
 
-        function displayPredictions(players, totalCount) {
+        function displayPredictions(players, totalCount, page=1, pageSize=24) {
             const content = document.getElementById('predictions-content');
             
             if (!players || players.length === 0) {
@@ -571,16 +596,19 @@ def index() -> str:
             let html = `
                 <div class="mb-4 flex justify-between items-center">
                     <strong>📊 ${totalCount} total players loaded</strong>
-                    <div class="text-sm text-gray-600">Showing top ${Math.min(players.length, 24)} predictions</div>
+                    <div class="text-sm text-gray-600">Page ${page} • ${pageSize} per page</div>
                 </div>
             `;
             
             // Display in a responsive grid
             html += '<div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">';
             
-            // Show more players (up to 24)
-            players.slice(0, 24).forEach((player, index) => {
-                const position = getPositionName(player.element_type || player.position_id);
+            // Pagination
+            const start = (page-1) * pageSize;
+            const end = Math.min(start + pageSize, players.length);
+            const pageItems = players.slice(start, end);
+            pageItems.forEach((player, index) => {
+                const position = player.position || getPositionName(player.element_type || player.position_id);
                 const predictedPoints = parseFloat(player.predicted_points || 0).toFixed(1);
                 
                 // Better price handling
@@ -632,6 +660,9 @@ def index() -> str:
                             <span>Form: ${form}</span>
                             <span>Own: ${selected}%</span>
                         </div>
+                        <div class="text-xs mt-1">
+                            ${renderStatusBadge(player.fpl_status, player.chance_next)}
+                        </div>
                         ${chance < 100 ? `<div class="text-xs text-orange-600 font-medium mt-1">Chance: ${chance}%</div>` : ''}
                         ${(player.xg_per90 || player.xa_per90) ? `<div class="text-xs text-gray-600 mt-1">xG/90: ${(player.xg_per90||0).toFixed ? (player.xg_per90||0).toFixed(2) : player.xg_per90} • xA/90: ${(player.xa_per90||0).toFixed ? (player.xa_per90||0).toFixed(2) : player.xa_per90}${next5Html ? ` ${next5Html}` : ''}</div>` : `${next5Html ? `<div class=\"text-[11px] text-gray-500 mt-1\">${next5Html}</div>` : ''}`}
                     </div>
@@ -640,16 +671,15 @@ def index() -> str:
             
             html += '</div>';
             
-            // Add show more button if there are more players
-            if (players.length > 24) {
-                html += `
-                    <div class="mt-4 text-center">
-                        <button onclick="showAllPredictions()" class="btn-primary">
-                            Show All ${players.length} Players
-                        </button>
-                    </div>
-                `;
-            }
+            // Pagination controls
+            const totalPages = Math.ceil(players.length / pageSize);
+            html += `
+                <div class="mt-4 flex justify-center items-center gap-2">
+                    <button class="btn-primary text-sm px-3 py-2" ${page<=1?'disabled':''} onclick="loadPredictions(${Math.max(1,page-1)}, ${pageSize})">Prev</button>
+                    <span class="text-sm text-gray-700">Page ${page} of ${totalPages}</span>
+                    <button class="btn-primary text-sm px-3 py-2" ${page>=totalPages?'disabled':''} onclick="loadPredictions(${Math.min(totalPages,page+1)}, ${pageSize})">Next</button>
+                </div>
+            `;
             
             content.innerHTML = html;
             
@@ -769,6 +799,18 @@ def index() -> str:
                 'GKP': 'GKP', 'DEF': 'DEF', 'MID': 'MID', 'FWD': 'FWD'
             };
             return positions[elementType] || positions[parseInt(elementType)] || 'UNK';
+        }
+
+        function renderStatusBadge(status, chance) {
+            const s = (status || 'a').toLowerCase();
+            const c = (chance === null || chance === undefined) ? null : Number(chance);
+            let label = 'Available';
+            let cls = 'bg-green-100 text-green-800';
+            if (s === 'i') { label = 'Injured'; cls = 'bg-red-100 text-red-800'; }
+            else if (s === 's') { label = 'Suspended'; cls = 'bg-red-100 text-red-800'; }
+            else if (s === 'd') { label = `Doubtful${c!==null?` ${c}%`:''}`; cls = 'bg-orange-100 text-orange-800'; }
+            else if (s === 'u') { label = 'Unavailable'; cls = 'bg-gray-200 text-gray-700'; }
+            return `<span class="px-2 py-0.5 rounded ${cls}">${label}</span>`;
         }
 
         // Show cache status
