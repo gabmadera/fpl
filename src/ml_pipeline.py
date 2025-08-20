@@ -519,7 +519,7 @@ class MLPipeline:
                         "event": ev, "opponent": th, "is_home": False, "fdr": da
                     })
 
-            # Map team_id -> next opponent/fdr and next5 difficulty metrics
+            # Map team_id -> next opponent/fdr and next5 difficulty metrics (also keep next5 opponent shorts)
             teams_meta = pd.DataFrame(self.fpl.bootstrap_static().get("teams", []))
             short_map = teams_meta.set_index('id')['short_name'].to_dict() if not teams_meta.empty else {}
             name_map = teams_meta.set_index('id')['name'].to_dict() if not teams_meta.empty else {}
@@ -529,6 +529,7 @@ class MLPipeline:
             next_fdrs = []
             next_opp_shorts = []
             next5_lists = []
+            next5_opp_shorts = []
             next5_avgs = []
             for _, row in results.iterrows():
                 tid = int(row.get("team_id")) if pd.notna(row.get("team_id")) else None
@@ -545,7 +546,9 @@ class MLPipeline:
                     next_opps.append(None); next_opp_shorts.append(None); next_is_home.append(None); next_fdrs.append(None)
                 # Next 5 FDR list and average
                 fdr_list = [int(x.get("fdr")) for x in arr if x.get("fdr") is not None][:5]
+                opp_short_list = [short_map.get(x.get("opponent")) for x in arr][:5]
                 next5_lists.append(fdr_list)
+                next5_opp_shorts.append(opp_short_list)
                 next5_avgs.append(float(np.mean(fdr_list)) if fdr_list else None)
 
             results["next_opponent"] = next_opps
@@ -553,6 +556,7 @@ class MLPipeline:
             results["next_is_home"] = next_is_home
             results["next_fdr"] = next_fdrs
             results["next5_fdr_list"] = next5_lists
+            results["next5_opp_shorts"] = next5_opp_shorts
             results["next5_fdr_avg"] = next5_avgs
         except Exception as e:
             # If fixtures not available, leave fields empty

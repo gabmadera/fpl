@@ -295,6 +295,9 @@ def fixtures() -> dict:
         fpl = FPLClient()
         fx = fpl.fixtures() or []
         teams = {t["id"]: t for t in (fpl.bootstrap_static().get("teams", []) or [])}
+        events = fpl.bootstrap_static().get("events", []) or []
+        current_gw = next((e["id"] for e in events if e.get("is_current", False)), None)
+        next_gw = next((e["id"] for e in events if e.get("is_next", False)), None)
         # Group fixtures by event
         by_gw: dict[int, list] = {}
         for f in fx:
@@ -316,7 +319,7 @@ def fixtures() -> dict:
         # Sort fixtures inside each GW
         for ev in by_gw:
             by_gw[ev] = sorted(by_gw[ev], key=lambda r: (r.get("kickoff_time") or ""))
-        return {"status": "success", "fixtures": by_gw}
+        return {"status": "success", "fixtures": by_gw, "current_gw": current_gw, "next_gw": next_gw}
     except Exception as e:
         return {"error": str(e)}
 
@@ -434,6 +437,15 @@ def index() -> str:
         <div class="flex justify-between items-center mb-4">
             <h2 class="text-xl font-bold text-gray-800">🗓️ Fixtures (by Gameweek)</h2>
             <button onclick="loadFixtures()" class="btn-primary">Load Fixtures</button>
+        </div>
+        <div class="flex items-center gap-3 mb-2">
+            <button id="toggle-fixtures" onclick="toggleFixtures()" class="text-sm text-gray-700 underline">Collapse</button>
+            <label class="text-sm text-gray-700">Show: </label>
+            <select id="fixtures-range" class="text-sm border rounded px-2 py-1" onchange="loadFixtures()">
+                <option value="next">Next GW</option>
+                <option value="current">Current GW</option>
+                <option value="all">All Upcoming</option>
+            </select>
         </div>
         <div id="fixtures-content" class="text-gray-600">Click "Load Fixtures" to see upcoming matches and FDR.</div>
     </div>
@@ -654,8 +666,13 @@ def index() -> str:
                 const data = await res.json();
                 if (!res.ok || data.status !== 'success') throw new Error(data.error || 'Failed to load fixtures');
                 const fx = data.fixtures || {};
+                const currentGw = data.current_gw;
+                const nextGw = data.next_gw;
+                const mode = document.getElementById('fixtures-range')?.value || 'next';
+                let gwKeys = Object.keys(fx).map(Number).sort((a,b)=> a-b);
+                if (mode === 'next' && nextGw) gwKeys = gwKeys.filter(g => g === Number(nextGw));
+                else if (mode === 'current' && currentGw) gwKeys = gwKeys.filter(g => g === Number(currentGw));
                 let html = '';
-                const gwKeys = Object.keys(fx).sort((a,b)=> Number(a)-Number(b));
                 gwKeys.forEach(gw => {
                     html += `<div class="mb-3"><div class="font-semibold text-gray-800">GW ${gw}</div>`;
                     html += '<div class="mt-1 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2">';
@@ -671,6 +688,19 @@ def index() -> str:
                 el.innerHTML = html || 'No fixtures found.';
             } catch (e) {
                 document.getElementById('fixtures-content').innerHTML = '❌ Failed to load fixtures';
+            }
+        }
+
+        function toggleFixtures() {
+            const el = document.getElementById('fixtures-content');
+            const btn = document.getElementById('toggle-fixtures');
+            if (!el || !btn) return;
+            if (el.classList.contains('hidden')) {
+                el.classList.remove('hidden');
+                btn.textContent = 'Collapse';
+            } else {
+                el.classList.add('hidden');
+                btn.textContent = 'Expand';
             }
         }
         
