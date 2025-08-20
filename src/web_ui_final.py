@@ -602,7 +602,8 @@ def index() -> str:
                 
                 const next5 = Array.isArray(player.next5_fdr_list) ? player.next5_fdr_list : [];
                 const next5avg = (player.next5_fdr_avg !== null && player.next5_fdr_avg !== undefined) ? Number(player.next5_fdr_avg).toFixed(2) : null;
-                const next5Html = next5.length ? `<div class="text-[11px] text-gray-500 mt-1">Next 5 FDR: [${next5.join(', ')}]${next5avg ? ` • avg ${next5avg}` : ''}</div>` : '';
+                const next5Title = next5.length ? `Next 5 FDR: [${next5.join(', ')}]${next5avg ? ` • avg ${next5avg}` : ''}` : '';
+                const next5Html = next5.length ? `<span class="ml-1 text-[11px] text-gray-500 cursor-help border-b border-dotted" title="${next5Title}">Next 5</span>` : '';
 
                 html += `
                     <div class="bg-white rounded-lg p-3 border shadow-sm hover:shadow-md transition-shadow">
@@ -620,8 +621,7 @@ def index() -> str:
                             <span>Own: ${selected}%</span>
                         </div>
                         ${chance < 100 ? `<div class="text-xs text-orange-600 font-medium mt-1">Chance: ${chance}%</div>` : ''}
-                        ${(player.xg_per90 || player.xa_per90) ? `<div class="text-xs text-gray-600 mt-1">xG/90: ${(player.xg_per90||0).toFixed ? (player.xg_per90||0).toFixed(2) : player.xg_per90} • xA/90: ${(player.xa_per90||0).toFixed ? (player.xa_per90||0).toFixed(2) : player.xa_per90}</div>` : ''}
-                        ${next5Html}
+                        ${(player.xg_per90 || player.xa_per90) ? `<div class="text-xs text-gray-600 mt-1">xG/90: ${(player.xg_per90||0).toFixed ? (player.xg_per90||0).toFixed(2) : player.xg_per90} • xA/90: ${(player.xa_per90||0).toFixed ? (player.xa_per90||0).toFixed(2) : player.xa_per90}${next5Html ? ` ${next5Html}` : ''}</div>` : `${next5Html ? `<div class=\"text-[11px] text-gray-500 mt-1\">${next5Html}</div>` : ''}`}
                     </div>
                 `;
             });
