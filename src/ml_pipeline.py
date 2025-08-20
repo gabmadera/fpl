@@ -130,13 +130,14 @@ class MLPipeline:
         try:
             current_year = 2025  # Current season
             us = self.understat.get_league_players("EPL", year=current_year)
+            us_prev = self.understat.get_league_players("EPL", year=current_year - 1)
             
             if not us.empty:
                 matcher = PlayerNameMatcher(df[["player_id", "name"]])
                 link = matcher.bulk_match(us, "name")
                 
-                # Get comprehensive Understat stats
-                us_stats = ["name", "xg_per90", "xa_per90", "npxg_per90", "shots_per90", "key_passes_per90"]
+                # Get comprehensive Understat stats (include minutes/time)
+                us_stats = ["name", "xg_per90", "xa_per90", "npxg_per90", "shots_per90", "key_passes_per90", "time", "games"]
                 available_stats = [col for col in us_stats if col in us.columns]
                 
                 if available_stats:
@@ -189,6 +190,30 @@ class MLPipeline:
                         # Position-adjusted threat scores
                         pos_multipliers = {"FWD": 1.2, "MID": 1.0, "DEF": 0.8, "GKP": 0.5}
                         df["adjusted_threat"] = df["total_threat_per90"] * df["position"].map(pos_multipliers).fillna(1.0)
+            # Blend previous season per90 if available to reduce early-season noise
+            if not us_prev.empty:
+                matcher_prev = PlayerNameMatcher(df[["player_id", "name"]])
+                link_prev = matcher_prev.bulk_match(us_prev, "name")
+                prev_cols = [c for c in ["name", "xg_per90", "xa_per90", "time"] if c in us_prev.columns]
+                if prev_cols:
+                    prev_sel = us_prev[prev_cols].rename(columns={"name": "other_name", "xg_per90": "xg_per90_prev", "xa_per90": "xa_per90_prev", "time": "time_prev"})
+                    prev_join = link_prev.merge(prev_sel, on="other_name", how="left")
+                    prev_agg = prev_join.groupby("player_id").agg({"xg_per90_prev": "mean", "xa_per90_prev": "mean", "time_prev": "mean"}).reset_index()
+                    df = df.merge(prev_agg, on="player_id", how="left")
+                    # If current per90 missing or low-minutes, blend with previous (60/40)
+                    for stat in [("xg_per90", "xg_per90_prev"), ("xa_per90", "xa_per90_prev")]:
+                        cur, prev = stat
+                        if cur in df.columns and prev in df.columns:
+                            cur_vals = pd.to_numeric(df[cur], errors="coerce")
+                            prev_vals = pd.to_numeric(df[prev], errors="coerce")
+                            # Weight by whether we have current minutes >= 270
+                            cur_minutes = pd.to_numeric(df.get("time"), errors="coerce").fillna(0)
+                            w_cur = (cur_minutes >= 270).astype(float) * 0.6 + (cur_minutes < 270).astype(float) * 0.3
+                            blended = w_cur.fillna(0.3) * cur_vals.fillna(0) + (1 - w_cur.fillna(0.7)) * prev_vals.fillna(0)
+                            df[cur] = blended.where(cur_vals.notna() | prev_vals.notna(), df[cur])
+            
+            # Apply minutes-aware shrinkage and positional clamps on xG/90 and xA/90
+            df = self._apply_xg_xa_shrinkage(df)
                         
         except Exception as e:
             print(f"Understat integration failed: {e}")
@@ -273,12 +298,74 @@ class MLPipeline:
         return max(0.0, min(1.0, start_prob)) * 2.0
 
     @staticmethod
+    def _predict_minutes(row: pd.Series) -> float:
+        """Simple xMins model using chance_next, fpl_status, and recent minutes if available."""
+        try:
+            chance = pd.to_numeric(row.get("chance_next"), errors="coerce")
+            status = str(row.get("fpl_status", "a")).lower()
+            # Base start probability from chance/status
+            if status in ["i", "s", "u"]:
+                start_prob = 0.05
+            elif status == "d":
+                start_prob = 0.5 if pd.isna(chance) else float(chance) / 100.0
+            else:
+                start_prob = 0.9 if pd.isna(chance) else float(chance) / 100.0
+            # Recent minutes proxy from rolling features if present
+            recent = pd.to_numeric(row.get("minutes_form_3"), errors="coerce")
+            if pd.isna(recent):
+                recent = pd.to_numeric(row.get("minutes"), errors="coerce")
+            # Scale expected minutes: starters ~ 85, others lower
+            exp_mins = 85.0 * start_prob
+            if pd.notna(recent):
+                exp_mins = max(20.0, min(90.0, 0.5 * exp_mins + 0.5 * min(90.0, recent)))
+            return float(exp_mins)
+        except Exception:
+            return 65.0
+
+    @staticmethod
     def _goal_points(position: str) -> int:
         return 6 if position == "GKP" or position == "DEF" else (5 if position == "MID" else 4)
 
     @staticmethod
     def _clean_sheet_points(position: str) -> int:
         return 4 if position in ("GKP", "DEF") else (1 if position == "MID" else 0)
+
+    @staticmethod
+    def _apply_xg_xa_shrinkage(df: pd.DataFrame) -> pd.DataFrame:
+        """Shrink xG/90 and xA/90 by minutes to avoid small-sample explosions and clamp by position."""
+        out = df.copy()
+        # Minutes from Understat if available; else use FPL minutes
+        minutes = pd.to_numeric(out.get("time"), errors="coerce")
+        if minutes is None or minutes.isna().all():
+            minutes = pd.to_numeric(out.get("minutes"), errors="coerce")
+        minutes = minutes.fillna(0)
+        # Priors by position (tune as backtests evolve)
+        priors = {
+            "FWD": {"xg": 0.35, "xa": 0.12, "xg_cap": 0.9, "xa_cap": 0.5},
+            "MID": {"xg": 0.18, "xa": 0.18, "xg_cap": 0.7, "xa_cap": 0.6},
+            "DEF": {"xg": 0.03, "xa": 0.08, "xg_cap": 0.25, "xa_cap": 0.3},
+            "GKP": {"xg": 0.005, "xa": 0.01, "xg_cap": 0.05, "xa_cap": 0.06},
+        }
+        xg = pd.to_numeric(out.get("xg_per90"), errors="coerce").fillna(np.nan)
+        xa = pd.to_numeric(out.get("xa_per90"), errors="coerce").fillna(np.nan)
+        pos = out.get("position").fillna("")
+        # Weight by minutes (up to 900 mins ~ 10 matches)
+        w = (minutes / 900.0).clip(lower=0.0, upper=1.0)
+        # Apply shrinkage and clamps row-wise
+        xg_final = []
+        xa_final = []
+        for i in range(len(out)):
+            p = priors.get(str(pos.iloc[i]), priors["MID"])
+            xg_i = xg.iloc[i]
+            xa_i = xa.iloc[i]
+            wi = w.iloc[i]
+            xg_blend = (wi * (0 if np.isnan(xg_i) else xg_i)) + ((1 - wi) * p["xg"]) if not np.isnan(xg_i) else p["xg"] * (1 - wi)
+            xa_blend = (wi * (0 if np.isnan(xa_i) else xa_i)) + ((1 - wi) * p["xa"]) if not np.isnan(xa_i) else p["xa"] * (1 - wi)
+            xg_final.append(float(max(0.0, min(p["xg_cap"], xg_blend))))
+            xa_final.append(float(max(0.0, min(p["xa_cap"], xa_blend))))
+        out["xg_per90"] = xg_final
+        out["xa_per90"] = xa_final
+        return out
 
     def _component_expected_points(self, df: pd.DataFrame) -> pd.Series:
         """Enhanced expected points calculation with better stat integration"""
@@ -299,7 +386,8 @@ class MLPipeline:
             except Exception:
                 start_prob = 0.9
             
-            expected_minutes = min(90.0, 85.0 * start_prob)  # More realistic minutes
+            # Use xMins model
+            expected_minutes = self._predict_minutes(r)
             
             # Enhanced xG/xA processing with fallback to FPL stats
             xv = pd.to_numeric(r.get("xg_per90"), errors="coerce")
@@ -600,6 +688,15 @@ class MLPipeline:
         results["value_score"] = (results["predicted_points"] / results["price"]).round(3)
         results["points_per_million"] = (results["predicted_points"] / results["price"] * 10).round(2)
         
+        # Multi-GW horizon: compute simple next-3 EP using next5 FDR average as proxy multiplier
+        if "next5_fdr_avg" in results.columns:
+            fdr = pd.to_numeric(results["next5_fdr_avg"], errors="coerce")
+            # Translate FDR avg (1–5) to an approximate multiplier (2=1.1, 3=1.0, 4=0.9)
+            horizon_mult = 1.0 + (2.5 - fdr.fillna(3.0)) * 0.05
+            results["predicted_points_next3"] = (results["predicted_points"] * horizon_mult).round(2)
+        else:
+            results["predicted_points_next3"] = results["predicted_points"]
+
         # Sort by predicted points and apply final filters
         preds = results.sort_values("predicted_points", ascending=False)
         

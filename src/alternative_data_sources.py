@@ -5,6 +5,7 @@ import pandas as pd
 import time
 from typing import Dict, List, Optional
 from .fpl_client import FPLClient
+from .config import config
 
 
 class AlternativeDataSources:
@@ -187,3 +188,28 @@ class AlternativeDataSources:
         
         print(f"Alternative sources: Enhanced {len(df)} players with fallback xG/xA data")
         return df
+
+    def get_free_odds_team_totals(self) -> Dict:
+        """Fetch basic odds snapshot from free APIs; returns raw JSON for now."""
+        # The Odds API (requires ODDSAPI_KEY)
+        if config.ODDSAPI_KEY:
+            try:
+                r = requests.get(
+                    "https://api.the-odds-api.com/v4/sports/soccer_epl/odds",
+                    params={"regions": "uk,eu", "markets": "h2h,totals", "apiKey": config.ODDSAPI_KEY, "oddsFormat": "decimal"},
+                    timeout=20,
+                )
+                if r.ok:
+                    return {"status": "ok", "source": "oddsapi", "raw": r.json()}
+            except Exception:
+                pass
+        # API-Football via RapidAPI (requires API_FOOTBALL_KEY)
+        if config.API_FOOTBALL_KEY:
+            try:
+                headers = {"x-rapidapi-host": "api-football-v1.p.rapidapi.com", "x-rapidapi-key": config.API_FOOTBALL_KEY}
+                r = requests.get("https://api-football-v1.p.rapidapi.com/v3/odds", headers=headers, params={"league": 39, "season": 2025}, timeout=20)
+                if r.ok:
+                    return {"status": "ok", "source": "api-football", "raw": r.json()}
+            except Exception:
+                pass
+        return {"status": "empty"}

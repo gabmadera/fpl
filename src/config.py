@@ -45,6 +45,8 @@ class Config:
     # Optional APIs
     RAPID_API_KEY: str | None = os.getenv("RAPID_API_KEY")
     FOOTBALL_API_KEY: str | None = os.getenv("FOOTBALL_API_KEY")
+    ODDSAPI_KEY: str | None = os.getenv("ODDSAPI_KEY")
+    API_FOOTBALL_KEY: str | None = os.getenv("API_FOOTBALL_KEY")
 
     # Dev
     DEBUG: bool = os.getenv("DEBUG", "False").lower() == "true"
