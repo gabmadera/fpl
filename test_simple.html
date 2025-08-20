@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>FPL UI Test</title>
+</head>
+<body>
+    <h1>FPL UI Button Test</h1>
+    
+    <button onclick="testBasic()">Test Basic JavaScript</button>
+    <button onclick="testAPI()">Test API Connection</button>
+    <button onclick="testQuickAction()">Test Quick Action</button>
+    
+    <div id="results"></div>
+
+    <script>
+        function testBasic() {
+            alert('✅ Basic JavaScript is working!');
+            document.getElementById('results').innerHTML += '<p>✅ JavaScript works</p>';
+        }
+        
+        function testAPI() {
+            console.log('Testing API...');
+            fetch('/health')
+                .then(response => response.json())
+                .then(data => {
+                    console.log('API response:', data);
+                    alert('✅ API works: ' + JSON.stringify(data));
+                    document.getElementById('results').innerHTML += '<p>✅ API works: ' + JSON.stringify(data) + '</p>';
+                })
+                .catch(error => {
+                    console.error('API error:', error);
+                    alert('❌ API failed: ' + error.message);
+                    document.getElementById('results').innerHTML += '<p>❌ API failed: ' + error.message + '</p>';
+                });
+        }
+        
+        function testQuickAction() {
+            console.log('Testing Quick Action...');
+            fetch('/quick-actions/log-current-suggestion', { method: 'POST' })
+                .then(response => response.json())
+                .then(data => {
+                    console.log('Quick action response:', data);
+                    alert('✅ Quick Action works: ' + JSON.stringify(data));
+                    document.getElementById('results').innerHTML += '<p>✅ Quick Action: ' + JSON.stringify(data) + '</p>';
+                })
+                .catch(error => {
+                    console.error('Quick action error:', error);
+                    alert('❌ Quick Action failed: ' + error.message);
+                    document.getElementById('results').innerHTML += '<p>❌ Quick Action failed: ' + error.message + '</p>';
+                });
+        }
+    </script>
+</body>
+</html>

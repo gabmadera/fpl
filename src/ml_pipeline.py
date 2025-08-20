@@ -475,11 +475,28 @@ class MLPipeline:
         # Clean NaN/inf values (np already imported at top)
         blended = np.nan_to_num(blended, nan=0.0, posinf=15.0, neginf=0.0)
 
-        # Enhanced result compilation
+        # Enhanced result compilation with team names and fixture info
         base_cols = ["player_id", "name", "position", "team_id", "price", "team_short", 
-                    "fpl_status", "chance_next", "xg_per90", "xa_per90"]
+                    "fpl_status", "chance_next", "xg_per90", "xa_per90", "element_type", "now_cost"]
         keep_cols = [c for c in base_cols if c in df.columns]
         results = df[keep_cols].copy()
+        
+        # Add team names from FPL API
+        try:
+            teams_data = pd.DataFrame(self.fpl.bootstrap_static().get("teams", []))
+            if not teams_data.empty:
+                team_map = teams_data.set_index('id')['name'].to_dict()
+                results['team_name'] = results['team_id'].map(team_map).fillna('Unknown Team')
+            else:
+                results['team_name'] = 'Unknown Team'
+        except:
+            results['team_name'] = 'Unknown Team'
+        
+        # Ensure price is properly converted
+        if 'now_cost' in results.columns:
+            results['now_cost'] = pd.to_numeric(results['now_cost'], errors='coerce') / 10.0
+        elif 'price' not in results.columns:
+            results['now_cost'] = 0.0
         
         # Add additional useful columns for UI
         extra_cols = ["selected_by_percent", "form", "points_per_game", "value_form", "value_season"]

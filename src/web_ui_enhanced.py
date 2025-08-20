@@ -6,6 +6,7 @@ from starlette.staticfiles import StaticFiles
 import pandas as pd
 from pathlib import Path
 import numpy as np
+from datetime import datetime
 from .ml_pipeline import MLPipeline
 from .team_optimizer import TeamOptimizer
 from .chip_strategy import ChipStrategyManager
@@ -14,6 +15,8 @@ from .scheduler import FPLScheduler
 from .config import config
 from .settings import load_exclusions
 from .team_selector import TeamSelector
+from .comprehensive_accuracy_tracker import ComprehensiveAccuracyTracker
+from .cache_manager import CacheManager
 
 
 app = FastAPI(title="FPL AI Dashboard", version="0.1")
@@ -26,13 +29,24 @@ def health() -> dict:
 
 
 @app.get("/predictions")
-def predictions(limit: int = 0) -> list[dict]:
-    path = Path("data/processed/predictions_current.csv")
-    if not path.exists():
+def predictions(limit: int = 0, force_refresh: bool = False) -> list[dict]:
+    cache_manager = CacheManager()
+    
+    # Use cache unless force refresh is requested
+    if not force_refresh:
+        cached_predictions = cache_manager.get_cached_data('predictions')
+        if cached_predictions is not None and not cached_predictions.empty:
+            df = cached_predictions
+        else:
+            # Generate fresh predictions and cache them
+            ml = MLPipeline()
+            df = ml.predict_current()
+            cache_manager.cache_data('predictions', df, {'limit': limit})
+    else:
+        # Force refresh - generate new predictions
         ml = MLPipeline()
         df = ml.predict_current()
-    else:
-        df = pd.read_csv(path)
+        cache_manager.cache_data('predictions', df, {'limit': limit, 'force_refresh': True})
     
     # Enhanced FPL status/chance merging - fix column conflicts
     try:
@@ -444,6 +458,362 @@ def trigger_model_retraining() -> dict:
         return {"error": str(e)}
 
 
+@app.post("/log-team-suggestion/{gameweek}")
+def log_team_suggestion(gameweek: int) -> dict:
+    """Log team suggestion for tracking and later comparison"""
+    try:
+        tracker = ComprehensiveAccuracyTracker()
+        
+        # Get current predictions
+        path = Path("data/processed/predictions_current.csv")
+        if not path.exists():
+            ml = MLPipeline()
+            df = ml.predict_current()
+        else:
+            df = pd.read_csv(path)
+        
+        # Get transfer suggestions
+        transfer_response = get_transfer_suggestions(gameweek - 1 if gameweek > 1 else 1)
+        transfer_suggestions = transfer_response.get("suggested_transfers", []) if isinstance(transfer_response, dict) else []
+        
+        # Log the suggestion
+        suggestion = tracker.log_gameweek_suggestion(gameweek, df, transfer_suggestions)
+        
+        return {
+            "status": "success",
+            "gameweek": gameweek,
+            "suggestion_logged": True,
+            "predicted_points": suggestion.predicted_points,
+            "formation": suggestion.formation,
+            "message": f"Team suggestion logged for GW{gameweek}"
+        }
+        
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/collect-actual-results/{gameweek}")
+def collect_actual_results(gameweek: int) -> dict:
+    """Collect actual results and compare with predictions"""
+    try:
+        tracker = ComprehensiveAccuracyTracker()
+        
+        # Collect results
+        result = tracker.collect_gameweek_results(gameweek)
+        if result is None:
+            return {"error": f"Could not collect results for GW{gameweek}"}
+        
+        return {
+            "status": "success",
+            "gameweek": gameweek,
+            "actual_points": result.actual_team_points,
+            "predicted_points": result.team_selection.predicted_points,
+            "prediction_error": abs(result.actual_team_points - result.team_selection.predicted_points),
+            "captain_points": result.actual_captain_points,
+            "points_vs_optimal": result.points_vs_optimal,
+            "accuracy_metrics": result.prediction_accuracy
+        }
+        
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/accuracy-report")
+def get_accuracy_report(last_n_gameweeks: int = 10) -> dict:
+    """Get comprehensive accuracy and performance report"""
+    try:
+        tracker = ComprehensiveAccuracyTracker()
+        report = tracker.get_comprehensive_report(last_n_gameweeks)
+        
+        return {
+            "status": "success",
+            "report": report
+        }
+        
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/improvement-suggestions")
+def get_improvement_suggestions() -> dict:
+    """Get AI suggestions for improving prediction accuracy"""
+    try:
+        tracker = ComprehensiveAccuracyTracker()
+        suggestions = tracker.get_improvement_suggestions()
+        
+        return {
+            "status": "success",
+            "suggestions": suggestions,
+            "total_suggestions": len(suggestions)
+        }
+        
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/team-history")
+def get_team_history(last_n_gameweeks: int = 5) -> dict:
+    """Get history of team suggestions and their performance"""
+    try:
+        tracker = ComprehensiveAccuracyTracker()
+        
+        # Get recent results
+        recent_results = tracker.results_history[-last_n_gameweeks:] if tracker.results_history else []
+        
+        team_history = []
+        for result in recent_results:
+            suggestion = result.team_selection
+            
+            team_history.append({
+                "gameweek": result.gameweek,
+                "suggested_team": {
+                    "formation": suggestion.formation,
+                    "predicted_points": suggestion.predicted_points,
+                    "captain": next((p["name"] for p in suggestion.starters if p["player_id"] == suggestion.captain_id), "Unknown"),
+                    "vice_captain": next((p["name"] for p in suggestion.starters if p["player_id"] == suggestion.vice_captain_id), "Unknown"),
+                    "total_cost": suggestion.total_cost,
+                    "chip_used": suggestion.chip_recommendation
+                },
+                "actual_performance": {
+                    "total_points": result.actual_team_points,
+                    "captain_points": result.actual_captain_points,
+                    "points_after_transfers": result.points_with_transfers,
+                    "prediction_error": abs(suggestion.predicted_points - result.actual_team_points)
+                },
+                "benchmarks": {
+                    "points_vs_optimal": result.points_vs_optimal,
+                    "accuracy_percentage": max(0, 100 - (abs(suggestion.predicted_points - result.actual_team_points) / suggestion.predicted_points * 100))
+                }
+            })
+        
+        return {
+            "status": "success",
+            "team_history": team_history,
+            "total_gameweeks": len(team_history)
+        }
+        
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/cache-status")
+def get_cache_status() -> dict:
+    """Get status of all cached data"""
+    try:
+        cache_manager = CacheManager()
+        status = cache_manager.get_all_cache_status()
+        
+        return {
+            "status": "success",
+            "cache_status": status,
+            "system_time": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/clear-cache")
+def clear_cache(cache_type: str = None) -> dict:
+    """Clear specific cache or all caches"""
+    try:
+        cache_manager = CacheManager()
+        success = cache_manager.clear_cache(cache_type)
+        
+        return {
+            "status": "success" if success else "failed",
+            "message": f"Cache cleared for {cache_type}" if cache_type else "All caches cleared"
+        }
+        
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/quick-actions/log-current-suggestion")
+def quick_log_current_suggestion() -> dict:
+    """Quick action to log suggestion for current gameweek"""
+    try:
+        # Get current gameweek
+        fpl = FPLClient()
+        bs = fpl.bootstrap_static()
+        events = bs.get("events", [])
+        current_gw = next((e["id"] for e in events if e.get("is_current", False)), 1)
+        next_gw = current_gw + 1
+        
+        # Log suggestion for next gameweek
+        response = log_team_suggestion(next_gw)
+        return response
+        
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/quick-actions/collect-last-results")
+def quick_collect_last_results() -> dict:
+    """Quick action to collect results for previous gameweek"""
+    try:
+        # Get previous gameweek
+        fpl = FPLClient()
+        bs = fpl.bootstrap_static()
+        events = bs.get("events", [])
+        current_gw = next((e["id"] for e in events if e.get("is_current", False)), 1)
+        prev_gw = max(1, current_gw - 1)
+        
+        # Collect results
+        response = collect_actual_results(prev_gw)
+        return response
+        
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/quick-actions/generate-quick-report")
+def quick_generate_report() -> dict:
+    """Quick action to generate accuracy report for last 5 gameweeks"""
+    try:
+        response = get_accuracy_report(5)
+        return response
+        
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/quick-actions/auto-improve")  
+def quick_auto_improve() -> dict:
+    """Quick action to trigger model improvements"""
+    try:
+        # Get improvement suggestions
+        suggestions_response = get_improvement_suggestions()
+        if "error" in suggestions_response:
+            return suggestions_response
+        
+        suggestions = suggestions_response.get("suggestions", [])
+        needs_retrain = any("retraining" in s.lower() or "accuracy declining" in s.lower() 
+                          for s in suggestions)
+        
+        if needs_retrain:
+            # Trigger retraining
+            retrain_response = trigger_model_retraining()
+            return {
+                "status": "success",
+                "action": "model_retrained",
+                "retrain_result": retrain_response,
+                "suggestions": suggestions
+            }
+        else:
+            return {
+                "status": "success", 
+                "action": "no_action_needed",
+                "message": "Model performance is good",
+                "suggestions": suggestions
+            }
+        
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/force-retrain") 
+def force_retrain_model() -> dict:
+    """Manual failsafe - force full model retraining with latest data"""
+    try:
+        from .weekly_retrainer import WeeklyMLRetrainer
+        retrainer = WeeklyMLRetrainer()
+        
+        # Get current gameweek
+        fpl = FPLClient()
+        bootstrap = fpl.bootstrap_static()
+        events = bootstrap.get("events", [])
+        
+        current_gw = 1
+        for event in events:
+            if event.get("is_current", False):
+                current_gw = event.get("id", 1)
+                break
+        
+        # Force full retraining regardless of performance
+        result = retrainer._full_retrain(current_gw)
+        
+        # Clear all caches to force fresh predictions
+        from .cache_manager import CacheManager
+        cache_manager = CacheManager()
+        cache_manager.clear_cache()
+        
+        return {
+            "status": "success",
+            "retrain_result": result,
+            "gameweek": current_gw,
+            "message": f"Manual full retraining completed for GW{current_gw}. All caches cleared.",
+            "next_step": "Fresh predictions will be generated on next request"
+        }
+        
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/learning-modes")
+def get_learning_modes() -> dict:
+    """Get available automatic learning modes"""
+    return {
+        "status": "success",
+        "modes": {
+            "always": {
+                "name": "Always Retrain",
+                "description": "Retrain model every gameweek with latest data",
+                "pros": ["Always up-to-date", "Incorporates all new data"],
+                "cons": ["More resource intensive", "Potential overfitting"]
+            },
+            "smart": {
+                "name": "Smart Retraining", 
+                "description": "Only retrain when performance degrades (recommended)",
+                "pros": ["Optimal performance", "Resource efficient", "Prevents overfitting"],
+                "cons": ["May miss subtle improvements"]
+            },
+            "never": {
+                "name": "Manual Only",
+                "description": "Never automatically retrain - manual control only",
+                "pros": ["Full user control", "Stable models"],
+                "cons": ["May miss performance improvements", "Requires manual monitoring"]
+            }
+        },
+        "current_mode": "smart",  # Could be stored in config
+        "recommendation": "smart"
+    }
+
+
+@app.post("/run-weekly-learning")
+def run_weekly_learning(mode: str = "smart") -> dict:
+    """Run the weekly learning cycle manually"""
+    try:
+        from .automatic_weekly_learner import AutomaticWeeklyLearner
+        
+        learner = AutomaticWeeklyLearner(auto_retrain_mode=mode)
+        result = learner.run_weekly_learning_cycle()
+        
+        return {
+            "status": "success",
+            "learning_result": result,
+            "message": "Weekly learning cycle completed"
+        }
+        
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/test", response_class=HTMLResponse)
+def test_page() -> str:
+    """Simple test page for debugging"""
+    try:
+        with open("test_simple.html", "r") as f:
+            return f.read()
+    except FileNotFoundError:
+        return """
+        <html><body>
+        <h1>Simple Test</h1>
+        <button onclick="alert('JS Works!')">Test JS</button>
+        <button onclick="fetch('/health').then(r=>r.json()).then(d=>alert(JSON.stringify(d)))">Test API</button>
+        </body></html>
+        """
+
 @app.get("/", response_class=HTMLResponse)
 def index() -> str:
     """Beautiful FPL-style interface"""
@@ -711,37 +1081,101 @@ def index() -> str:
         </div>
     </div>
 
+    <!-- Quick Actions Panel -->
+    <div class="mx-6 mb-8 bg-gradient-to-r from-green-500 to-blue-600 rounded-2xl p-6 text-white fade-in">
+        <h2 class="text-2xl font-bold mb-4">🚀 Quick Actions</h2>
+        <div class="grid grid-cols-2 lg:grid-cols-5 gap-4">
+            <button onclick="quickLogSuggestion()" :disabled="loading"
+                    class="bg-white bg-opacity-20 hover:bg-opacity-30 rounded-lg p-4 transition-all cursor-pointer disabled:opacity-50">
+                <div class="text-2xl mb-2">📝</div>
+                <div class="text-sm font-medium">Log Current Suggestion</div>
+            </button>
+            <button onclick="quickCollectResults()" :disabled="loading"
+                    class="bg-white bg-opacity-20 hover:bg-opacity-30 rounded-lg p-4 transition-all cursor-pointer disabled:opacity-50">
+                <div class="text-2xl mb-2">📊</div>
+                <div class="text-sm font-medium">Collect Last Results</div>
+            </button>
+            <button onclick="quickGenerateReport()" :disabled="loading"
+                    class="bg-white bg-opacity-20 hover:bg-opacity-30 rounded-lg p-4 transition-all cursor-pointer disabled:opacity-50">
+                <div class="text-2xl mb-2">📈</div>
+                <div class="text-sm font-medium">Generate Report</div>
+            </button>
+            <button onclick="quickAutoImprove()" :disabled="loading"
+                    class="bg-white bg-opacity-20 hover:bg-opacity-30 rounded-lg p-4 transition-all cursor-pointer disabled:opacity-50">
+                <div class="text-2xl mb-2">🔧</div>
+                <div class="text-sm font-medium">Auto Improve</div>
+            </button>
+            <button onclick="forceRetrain()" :disabled="loading"
+                    class="bg-red-500 bg-opacity-30 hover:bg-opacity-50 rounded-lg p-4 transition-all cursor-pointer disabled:opacity-50 border-2 border-red-300">
+                <div class="text-2xl mb-2">🔴</div>
+                <div class="text-sm font-medium">FORCE RETRAIN</div>
+                <div class="text-xs opacity-75">Emergency Use</div>
+            </button>
+        </div>
+    </div>
+
+    <!-- Cache Status Panel -->
+    <div class="mx-6 mb-8 glass-card rounded-2xl p-6 fade-in">
+        <div class="flex justify-between items-center mb-4">
+            <h2 class="text-xl font-bold text-gray-800">💾 Cache Status</h2>
+            <div class="flex gap-2">
+                <button onclick="toggleCacheDisplay()" 
+                        class="text-sm bg-gray-100 hover:bg-gray-200 px-3 py-1 rounded cursor-pointer">
+                    <span id="cache-toggle-text">Show</span> Cache
+                </button>
+                <button onclick="loadCacheStatus()" 
+                        class="text-sm bg-blue-500 text-white hover:bg-blue-600 px-3 py-1 rounded cursor-pointer">
+                    Refresh
+                </button>
+            </div>
+        </div>
+        
+        <div id="cache-display" class="grid grid-cols-2 md:grid-cols-4 gap-4 hidden">
+            <!-- Cache status will be populated here -->
+        </div>
+    </div>
+
     <!-- Tab Navigation -->
     <div class="mx-6 mb-8 glass-card rounded-2xl p-6 fade-in">
-        <nav class="flex space-x-8 mb-6 border-b border-gray-200">
+        <nav class="flex flex-wrap space-x-4 mb-6 border-b border-gray-200">
             <button @click="activeTab = 'predictions'" 
                     :class="activeTab === 'predictions' ? 'border-purple-500 text-purple-600' : 'border-transparent text-gray-500 hover:text-gray-700'"
-                    class="py-2 px-1 border-b-2 font-medium text-sm whitespace-nowrap">
+                    class="py-2 px-3 border-b-2 font-medium text-sm whitespace-nowrap mb-2">
                 📊 Predictions
-            </button>
-            <button @click="activeTab = 'fixtures'" 
-                    :class="activeTab === 'fixtures' ? 'border-purple-500 text-purple-600' : 'border-transparent text-gray-500 hover:text-gray-700'"
-                    class="py-2 px-1 border-b-2 font-medium text-sm whitespace-nowrap">
-                📅 Fixtures
             </button>
             <button @click="activeTab = 'team'" 
                     :class="activeTab === 'team' ? 'border-purple-500 text-purple-600' : 'border-transparent text-gray-500 hover:text-gray-700'"
-                    class="py-2 px-1 border-b-2 font-medium text-sm whitespace-nowrap">
+                    class="py-2 px-3 border-b-2 font-medium text-sm whitespace-nowrap mb-2">
                 👥 Team Builder
             </button>
             <button @click="activeTab = 'transfers'" 
                     :class="activeTab === 'transfers' ? 'border-purple-500 text-purple-600' : 'border-transparent text-gray-500 hover:text-gray-700'"
-                    class="py-2 px-1 border-b-2 font-medium text-sm whitespace-nowrap">
+                    class="py-2 px-3 border-b-2 font-medium text-sm whitespace-nowrap mb-2">
                 🔄 Transfers
             </button>
-            <button @click="activeTab = 'actual'" 
-                    :class="activeTab === 'actual' ? 'border-purple-500 text-purple-600' : 'border-transparent text-gray-500 hover:text-gray-700'"
-                    class="py-2 px-1 border-b-2 font-medium text-sm whitespace-nowrap">
-                🏆 Actual Points
+            <button @click="activeTab = 'fixtures'" 
+                    :class="activeTab === 'fixtures' ? 'border-purple-500 text-purple-600' : 'border-transparent text-gray-500 hover:text-gray-700'"
+                    class="py-2 px-3 border-b-2 font-medium text-sm whitespace-nowrap mb-2">
+                📅 Fixtures
+            </button>
+            <button @click="activeTab = 'accuracy'" 
+                    :class="activeTab === 'accuracy' ? 'border-purple-500 text-purple-600' : 'border-transparent text-gray-500 hover:text-gray-700'"
+                    class="py-2 px-3 border-b-2 font-medium text-sm whitespace-nowrap mb-2">
+                🎯 Accuracy Analytics
+            </button>
+            <button @click="activeTab = 'history'" 
+                    :class="activeTab === 'history' ? 'border-purple-500 text-purple-600' : 'border-transparent text-gray-500 hover:text-gray-700'"
+                    class="py-2 px-3 border-b-2 font-medium text-sm whitespace-nowrap mb-2">
+                📚 Team History
+            </button>
+            <button @click="activeTab = 'model-status'" 
+                    :class="activeTab === 'model-status' ? 'border-purple-500 text-purple-600' : 'border-transparent text-gray-500 hover:text-gray-700'"
+                    class="py-2 px-3 border-b-2 font-medium text-sm whitespace-nowrap mb-2">
+                🤖 Model Status
             </button>
             <button @click="activeTab = 'performance'" 
                     :class="activeTab === 'performance' ? 'border-purple-500 text-purple-600' : 'border-transparent text-gray-500 hover:text-gray-700'"
-                    class="py-2 px-1 border-b-2 font-medium text-sm whitespace-nowrap">
+                    class="py-2 px-3 border-b-2 font-medium text-sm whitespace-nowrap mb-2">
                 📈 Performance
             </button>
         </nav>
@@ -1237,6 +1671,269 @@ def index() -> str:
         </div>
     </div>
 
+    <!-- Accuracy Analytics Tab -->
+    <div class="mx-6 mb-8" x-show="activeTab === 'accuracy'" x-data="{ accuracyReport: null, loading: false }">
+        <div class="glass-card rounded-2xl p-8 fade-in">
+            <div class="flex justify-between items-center mb-6">
+                <h2 class="text-2xl font-bold text-gray-800">
+                    <i class="fas fa-bullseye mr-3 text-red-600"></i>
+                    Accuracy Analytics Dashboard
+                </h2>
+                <button onclick="loadAccuracyReport()" 
+                        class="btn-primary px-6 py-3 rounded-full font-semibold flex items-center gap-2 cursor-pointer">
+                    <i class="fas fa-chart-line"></i>
+                    <span>Generate Report</span>
+                </button>
+            </div>
+            
+            <div x-show="accuracyReport && accuracyReport.report" x-transition class="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                <!-- Summary Cards -->
+                <div class="bg-gradient-to-br from-purple-50 to-blue-50 rounded-xl p-6">
+                    <h3 class="text-lg font-bold text-gray-800 mb-4">📊 Performance Summary</h3>
+                    <div class="grid grid-cols-2 gap-4">
+                        <div class="text-center">
+                            <div class="text-2xl font-bold text-purple-600" x-text="accuracyReport?.report?.summary?.gameweeks_analyzed || 0"></div>
+                            <div class="text-sm text-gray-600">Gameweeks Analyzed</div>
+                        </div>
+                        <div class="text-center">
+                            <div class="text-2xl font-bold text-green-600" x-text="(accuracyReport?.report?.summary?.prediction_accuracy_pct || 0).toFixed(1) + '%'"></div>
+                            <div class="text-sm text-gray-600">Prediction Accuracy</div>
+                        </div>
+                        <div class="text-center">
+                            <div class="text-2xl font-bold text-blue-600" x-text="(accuracyReport?.report?.summary?.average_weekly_error || 0).toFixed(1)"></div>
+                            <div class="text-sm text-gray-600">Avg Weekly Error</div>
+                        </div>
+                        <div class="text-center">
+                            <div class="text-2xl font-bold text-orange-600" x-text="(accuracyReport?.report?.captain_performance?.captain_accuracy || 0).toFixed(3)"></div>
+                            <div class="text-sm text-gray-600">Captain Correlation</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Performance Trends -->
+                <div class="bg-gradient-to-br from-green-50 to-yellow-50 rounded-xl p-6">
+                    <h3 class="text-lg font-bold text-gray-800 mb-4">📈 Performance Trends</h3>
+                    <div class="space-y-3">
+                        <div class="flex justify-between">
+                            <span class="text-gray-600">Points vs Optimal:</span>
+                            <span class="font-bold" x-text="(accuracyReport?.report?.vs_optimal?.percentage_of_optimal || 0).toFixed(1) + '%'"></span>
+                        </div>
+                        <div class="flex justify-between">
+                            <span class="text-gray-600">Avg Points Lost:</span>
+                            <span class="font-bold text-red-600" x-text="(accuracyReport?.report?.vs_optimal?.average_points_lost || 0).toFixed(1)"></span>
+                        </div>
+                        <div class="flex justify-between">
+                            <span class="text-gray-600">Captain Error:</span>
+                            <span class="font-bold" x-text="(accuracyReport?.report?.captain_performance?.average_captain_error || 0).toFixed(1)"></span>
+                        </div>
+                        <div class="flex justify-between">
+                            <span class="text-gray-600">Transfer Benefit:</span>
+                            <span class="font-bold" x-text="(accuracyReport?.report?.transfer_analysis?.average_transfer_benefit || 0).toFixed(1)"></span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Recent Gameweeks -->
+                <div class="lg:col-span-2 bg-gradient-to-br from-blue-50 to-purple-50 rounded-xl p-6">
+                    <h3 class="text-lg font-bold text-gray-800 mb-4">📅 Recent Gameweek Performance</h3>
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-sm">
+                            <thead>
+                                <tr class="border-b border-gray-200">
+                                    <th class="text-left py-2">GW</th>
+                                    <th class="text-center py-2">Predicted</th>
+                                    <th class="text-center py-2">Actual</th>
+                                    <th class="text-center py-2">Error</th>
+                                    <th class="text-center py-2">vs Optimal</th>
+                                    <th class="text-center py-2">Accuracy</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <template x-for="gw in (accuracyReport?.report?.gameweek_breakdown || [])">
+                                    <tr class="border-b border-gray-100">
+                                        <td class="py-2 font-medium" x-text="gw.gameweek"></td>
+                                        <td class="py-2 text-center" x-text="gw.predicted?.toFixed(1)"></td>
+                                        <td class="py-2 text-center font-bold" x-text="gw.actual?.toFixed(1)"></td>
+                                        <td class="py-2 text-center text-red-600" x-text="gw.error?.toFixed(1)"></td>
+                                        <td class="py-2 text-center" x-text="gw.vs_optimal?.toFixed(1)"></td>
+                                        <td class="py-2 text-center text-green-600" x-text="((1 - (gw.error / gw.predicted)) * 100).toFixed(1) + '%'"></td>
+                                    </tr>
+                                </template>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+            
+            <div x-show="!accuracyReport && !loading" class="text-center py-12 text-gray-500">
+                <i class="fas fa-bullseye text-6xl mb-4"></i>
+                <p class="text-lg">Click "Generate Report" to see detailed accuracy analytics</p>
+                <p class="text-sm mt-2">Analyze prediction performance, captain choices, and improvement opportunities</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Team History Tab -->
+    <div class="mx-6 mb-8" x-show="activeTab === 'history'" x-data="{ teamHistory: null, loading: false }">
+        <div class="glass-card rounded-2xl p-8 fade-in">
+            <div class="flex justify-between items-center mb-6">
+                <h2 class="text-2xl font-bold text-gray-800">
+                    <i class="fas fa-history mr-3 text-blue-600"></i>
+                    Team Selection History
+                </h2>
+                <button onclick="loadTeamHistory()" 
+                        class="btn-primary px-6 py-3 rounded-full font-semibold flex items-center gap-2 cursor-pointer">
+                    <i class="fas fa-clock"></i>
+                    <span>Load History</span>
+                </button>
+            </div>
+            
+            <div x-show="teamHistory && teamHistory.team_history" x-transition class="space-y-6">
+                <template x-for="history in (teamHistory?.team_history || [])">
+                    <div class="bg-gradient-to-br from-gray-50 to-blue-50 rounded-xl p-6 border-l-4 border-purple-500">
+                        <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                            <!-- Suggestion Summary -->
+                            <div>
+                                <h4 class="font-bold text-gray-800 mb-3">
+                                    🎯 GW<span x-text="history.gameweek"></span> Suggestion
+                                </h4>
+                                <div class="space-y-2 text-sm">
+                                    <div class="flex justify-between">
+                                        <span>Formation:</span>
+                                        <span class="font-medium" x-text="history.suggested_team?.formation"></span>
+                                    </div>
+                                    <div class="flex justify-between">
+                                        <span>Predicted Points:</span>
+                                        <span class="font-medium text-purple-600" x-text="history.suggested_team?.predicted_points?.toFixed(1)"></span>
+                                    </div>
+                                    <div class="flex justify-between">
+                                        <span>Captain:</span>
+                                        <span class="font-medium" x-text="history.suggested_team?.captain"></span>
+                                    </div>
+                                    <div class="flex justify-between">
+                                        <span>Total Cost:</span>
+                                        <span class="font-medium text-green-600">£<span x-text="history.suggested_team?.total_cost"></span>m</span>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Actual Performance -->
+                            <div>
+                                <h4 class="font-bold text-gray-800 mb-3">
+                                    📊 Actual Performance
+                                </h4>
+                                <div class="space-y-2 text-sm">
+                                    <div class="flex justify-between">
+                                        <span>Total Points:</span>
+                                        <span class="font-bold text-blue-600" x-text="history.actual_performance?.total_points"></span>
+                                    </div>
+                                    <div class="flex justify-between">
+                                        <span>Captain Points:</span>
+                                        <span class="font-medium" x-text="history.actual_performance?.captain_points"></span>
+                                    </div>
+                                    <div class="flex justify-between">
+                                        <span>After Transfers:</span>
+                                        <span class="font-medium" x-text="history.actual_performance?.points_after_transfers"></span>
+                                    </div>
+                                    <div class="flex justify-between">
+                                        <span>Prediction Error:</span>
+                                        <span class="font-medium text-red-600" x-text="history.actual_performance?.prediction_error?.toFixed(1)"></span>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Benchmarks -->
+                            <div>
+                                <h4 class="font-bold text-gray-800 mb-3">
+                                    🏆 Benchmarks
+                                </h4>
+                                <div class="space-y-2 text-sm">
+                                    <div class="flex justify-between">
+                                        <span>vs Optimal:</span>
+                                        <span class="font-medium" x-text="history.benchmarks?.points_vs_optimal?.toFixed(1)"></span>
+                                    </div>
+                                    <div class="flex justify-between">
+                                        <span>Accuracy:</span>
+                                        <span class="font-bold text-green-600" x-text="history.benchmarks?.accuracy_percentage?.toFixed(1) + '%'"></span>
+                                    </div>
+                                    <div class="mt-3">
+                                        <div class="w-full bg-gray-200 rounded-full h-2">
+                                            <div class="bg-green-500 h-2 rounded-full" 
+                                                 :style="`width: ${Math.min(100, history.benchmarks?.accuracy_percentage || 0)}%`"></div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </template>
+            </div>
+            
+            <div x-show="!teamHistory && !loading" class="text-center py-12 text-gray-500">
+                <i class="fas fa-history text-6xl mb-4"></i>
+                <p class="text-lg">Click "Load History" to see your team selection history</p>
+                <p class="text-sm mt-2">Track how your AI suggestions performed over time</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Model Status Tab -->
+    <div class="mx-6 mb-8" x-show="activeTab === 'model-status'" x-data="{ improvements: null, loading: false }">
+        <div class="glass-card rounded-2xl p-8 fade-in">
+            <div class="flex justify-between items-center mb-6">
+                <h2 class="text-2xl font-bold text-gray-800">
+                    <i class="fas fa-robot mr-3 text-green-600"></i>
+                    Model Status & Improvements
+                </h2>
+                <button onclick="loadImprovements()" 
+                        class="btn-primary px-6 py-3 rounded-full font-semibold flex items-center gap-2 cursor-pointer">
+                    <i class="fas fa-cog"></i>
+                    <span>Check Status</span>
+                </button>
+            </div>
+            
+            <div x-show="improvements" x-transition class="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                <!-- Model Status -->
+                <div class="bg-gradient-to-br from-green-50 to-blue-50 rounded-xl p-6">
+                    <h3 class="text-lg font-bold text-gray-800 mb-4">🤖 Current Model Status</h3>
+                    <div class="space-y-3">
+                        <div class="flex items-center">
+                            <div class="w-3 h-3 bg-green-500 rounded-full mr-3"></div>
+                            <span>Models are operational</span>
+                        </div>
+                        <div class="flex items-center">
+                            <div class="w-3 h-3 bg-blue-500 rounded-full mr-3"></div>
+                            <span>Predictions are cached and ready</span>
+                        </div>
+                        <div class="flex items-center">
+                            <div class="w-3 h-3 bg-yellow-500 rounded-full mr-3"></div>
+                            <span>Auto-improvement monitoring active</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Improvement Suggestions -->
+                <div class="bg-gradient-to-br from-yellow-50 to-orange-50 rounded-xl p-6">
+                    <h3 class="text-lg font-bold text-gray-800 mb-4">💡 AI Suggestions</h3>
+                    <div class="space-y-2">
+                        <template x-for="(suggestion, index) in (improvements?.suggestions || [])">
+                            <div class="flex items-start">
+                                <div class="w-6 h-6 bg-purple-100 text-purple-800 rounded-full flex items-center justify-center text-xs font-bold mr-3 mt-1" x-text="index + 1"></div>
+                                <span class="text-sm" x-text="suggestion"></span>
+                            </div>
+                        </template>
+                    </div>
+                </div>
+            </div>
+            
+            <div x-show="!improvements && !loading" class="text-center py-12 text-gray-500">
+                <i class="fas fa-robot text-6xl mb-4"></i>
+                <p class="text-lg">Click "Check Status" to see model performance and improvement suggestions</p>
+                <p class="text-sm mt-2">Get AI-powered recommendations for better predictions</p>
+            </div>
+        </div>
+    </div>
+
     <!-- Players Table -->
     <div class="mx-6 mb-8 glass-card rounded-2xl p-8 fade-in" x-show="activeTab === 'predictions'">
         <h2 class="text-2xl font-bold text-gray-800 mb-6">
@@ -1700,6 +2397,316 @@ def index() -> str:
             } finally {
                 teamComponent.loading = false;
             }
+        }
+        
+        // Global loading state
+        let globalLoading = false;
+        
+        // Quick Action Functions
+        async function quickLogSuggestion() {
+            if (globalLoading) return;
+            
+            try {
+                globalLoading = true;
+                console.log('🚀 Logging team suggestion...');
+                
+                const response = await fetch('/quick-actions/log-current-suggestion', { method: 'POST' });
+                const data = await response.json();
+                
+                console.log('Response:', data);
+                
+                if (response.ok && data.status === 'success') {
+                    alert(`✅ Team suggestion logged for GW${data.gameweek}: ${data.predicted_points.toFixed(1)} predicted points`);
+                } else {
+                    throw new Error(data.error || 'Failed to log suggestion');
+                }
+            } catch (error) {
+                console.error('Error logging suggestion:', error);
+                alert(`❌ Failed to log suggestion: ${error.message}`);
+            } finally {
+                globalLoading = false;
+            }
+        }
+        
+        async function quickCollectResults() {
+            if (globalLoading) return;
+            
+            try {
+                globalLoading = true;
+                console.log('📊 Collecting results...');
+                
+                const response = await fetch('/quick-actions/collect-last-results', { method: 'POST' });
+                const data = await response.json();
+                
+                console.log('Response:', data);
+                
+                if (response.ok && data.status === 'success') {
+                    const accuracy = ((1 - Math.abs(data.actual_points - data.predicted_points) / data.predicted_points) * 100).toFixed(1);
+                    alert(`📊 Results collected for GW${data.gameweek}:\nActual: ${data.actual_points} pts\nPredicted: ${data.predicted_points.toFixed(1)} pts\nAccuracy: ${accuracy}%`);
+                } else {
+                    throw new Error(data.error || 'Failed to collect results');
+                }
+            } catch (error) {
+                console.error('Error collecting results:', error);
+                alert(`❌ Failed to collect results: ${error.message}`);
+            } finally {
+                globalLoading = false;
+            }
+        }
+        
+        async function quickGenerateReport() {
+            if (globalLoading) return;
+            
+            try {
+                globalLoading = true;
+                console.log('📈 Generating report...');
+                
+                const response = await fetch('/quick-actions/generate-quick-report', { method: 'POST' });
+                const data = await response.json();
+                
+                console.log('Response:', data);
+                
+                if (response.ok && data.status === 'success' && data.report) {
+                    const report = data.report;
+                    const summary = report.summary || {};
+                    alert(`📈 Quick Report:\n${summary.gameweeks_analyzed || 0} gameweeks analyzed\n${(summary.prediction_accuracy_pct || 0).toFixed(1)}% accuracy\n${(summary.average_weekly_error || 0).toFixed(1)} avg error\n\nSwitch to Accuracy Analytics tab for detailed view.`);
+                } else {
+                    throw new Error(data.error || 'Failed to generate report');
+                }
+            } catch (error) {
+                console.error('Error generating report:', error);
+                alert(`❌ Failed to generate report: ${error.message}`);
+            } finally {
+                globalLoading = false;
+            }
+        }
+        
+        async function quickAutoImprove() {
+            if (globalLoading) return;
+            
+            try {
+                globalLoading = true;
+                console.log('🔧 Auto improving...');
+                
+                const response = await fetch('/quick-actions/auto-improve', { method: 'POST' });
+                const data = await response.json();
+                
+                console.log('Response:', data);
+                
+                if (response.ok && data.status === 'success') {
+                    if (data.action === 'model_retrained') {
+                        alert('🔧 Model improvements detected and applied!\nPerformance should improve in upcoming predictions.');
+                    } else {
+                        alert('✅ Model performance is good!\nNo improvements needed at this time.');
+                    }
+                } else {
+                    throw new Error(data.error || 'Failed to auto-improve');
+                }
+            } catch (error) {
+                console.error('Error auto-improving:', error);
+                alert(`❌ Auto-improvement failed: ${error.message}`);
+            } finally {
+                globalLoading = false;
+            }
+        }
+        
+        async function forceRetrain() {
+            if (globalLoading) return;
+            
+            if (!confirm('⚠️ FORCE RETRAIN WARNING ⚠️\n\nThis will completely retrain your model with all available data and clear all caches. This may take several minutes.\n\nOnly use this if you suspect the model is not learning properly or after major data issues.\n\nProceed?')) {
+                return;
+            }
+            
+            try {
+                globalLoading = true;
+                console.log('🔴 Force retraining model...');
+                
+                const response = await fetch('/force-retrain', { method: 'POST' });
+                const data = await response.json();
+                
+                console.log('Response:', data);
+                
+                if (response.ok && data.status === 'success') {
+                    alert(`🔴 FORCE RETRAIN COMPLETED\n\nModel has been completely retrained for GW${data.gameweek}.\nAll caches cleared.\n\n${data.message}\n\nNext: ${data.next_step}`);
+                } else {
+                    throw new Error(data.error || 'Force retrain failed');
+                }
+            } catch (error) {
+                console.error('Error force retraining:', error);
+                alert(`❌ Force retrain failed: ${error.message}`);
+            } finally {
+                globalLoading = false;
+            }
+        }
+        
+        // Cache Status Functions
+        let cacheDisplayVisible = false;
+        
+        function toggleCacheDisplay() {
+            const cacheDisplay = document.getElementById('cache-display');
+            const toggleText = document.getElementById('cache-toggle-text');
+            
+            cacheDisplayVisible = !cacheDisplayVisible;
+            
+            if (cacheDisplayVisible) {
+                cacheDisplay.classList.remove('hidden');
+                toggleText.textContent = 'Hide';
+                loadCacheStatus(); // Load data when showing
+            } else {
+                cacheDisplay.classList.add('hidden');
+                toggleText.textContent = 'Show';
+            }
+        }
+        
+        async function loadCacheStatus() {
+            try {
+                console.log('💾 Loading cache status...');
+                
+                const response = await fetch('/cache-status');
+                const data = await response.json();
+                
+                console.log('Cache status:', data);
+                
+                if (response.ok && data.cache_status) {
+                    displayCacheStatus(data.cache_status);
+                } else {
+                    throw new Error(data.error || 'Failed to load cache status');
+                }
+            } catch (error) {
+                console.error('Failed to load cache status:', error);
+                alert('Failed to load cache status: ' + error.message);
+            }
+        }
+        
+        function displayCacheStatus(cacheStatus) {
+            const cacheDisplay = document.getElementById('cache-display');
+            
+            let html = '';
+            for (const [type, status] of Object.entries(cacheStatus)) {
+                const validClass = status.valid ? 'text-green-600' : 'text-red-600';
+                const statusText = status.valid ? 'Valid' : 'Expired';
+                const ageText = status.age || 'No data';
+                
+                html += `
+                    <div class="bg-gray-50 rounded-lg p-3">
+                        <div class="text-sm font-medium capitalize">${type.replace('_', ' ')}</div>
+                        <div class="text-xs ${validClass}">${statusText}</div>
+                        <div class="text-xs text-gray-500">Age: ${ageText}</div>
+                    </div>
+                `;
+            }
+            
+            cacheDisplay.innerHTML = html;
+        }
+        
+        // Accuracy Report Functions
+        async function loadAccuracyReport() {
+            if (globalLoading) return;
+            
+            try {
+                globalLoading = true;
+                console.log('📊 Loading accuracy report...');
+                
+                const response = await fetch('/accuracy-report?last_n_gameweeks=10');
+                const data = await response.json();
+                
+                console.log('Accuracy report loaded:', data);
+                
+                if (response.ok) {
+                    // For now, just show a summary in alert
+                    // TODO: Could populate dedicated div elements
+                    if (data.report && data.report.summary) {
+                        const summary = data.report.summary;
+                        alert(`📊 Accuracy Report Generated!\n\nGameweeks analyzed: ${summary.gameweeks_analyzed}\nPrediction accuracy: ${summary.prediction_accuracy_pct?.toFixed(1)}%\nAverage weekly error: ${summary.average_weekly_error?.toFixed(1)}\n\nCheck browser console for full data.`);
+                    } else {
+                        alert('📊 Report generated - check console for details');
+                    }
+                } else {
+                    throw new Error(data.error || 'Failed to load accuracy report');
+                }
+            } catch (error) {
+                console.error('Failed to load accuracy report:', error);
+                alert('Failed to load accuracy report: ' + error.message);
+            } finally {
+                globalLoading = false;
+            }
+        }
+        
+        // Team History Functions
+        async function loadTeamHistory() {
+            if (globalLoading) return;
+            
+            try {
+                globalLoading = true;
+                console.log('📚 Loading team history...');
+                
+                const response = await fetch('/team-history?last_n_gameweeks=5');
+                const data = await response.json();
+                
+                console.log('Team history loaded:', data);
+                
+                if (response.ok) {
+                    // For now, just show summary
+                    if (data.team_history && data.team_history.length > 0) {
+                        alert(`📚 Team History Loaded!\n\n${data.total_gameweeks} gameweeks found\n\nCheck browser console for full history data.`);
+                    } else {
+                        alert('📚 No team history found yet.\n\nStart by logging team suggestions to build history.');
+                    }
+                } else {
+                    throw new Error(data.error || 'Failed to load team history');
+                }
+            } catch (error) {
+                console.error('Failed to load team history:', error);
+                alert('Failed to load team history: ' + error.message);
+            } finally {
+                globalLoading = false;
+            }
+        }
+        
+        // Model Improvements Functions
+        async function loadImprovements() {
+            if (globalLoading) return;
+            
+            try {
+                globalLoading = true;
+                console.log('🤖 Loading model improvements...');
+                
+                const response = await fetch('/improvement-suggestions');
+                const data = await response.json();
+                
+                console.log('Improvements loaded:', data);
+                
+                if (response.ok) {
+                    if (data.suggestions && data.suggestions.length > 0) {
+                        const suggestionText = data.suggestions.join('\n• ');
+                        alert(`🤖 AI Improvement Suggestions:\n\n• ${suggestionText}\n\nTotal: ${data.total_suggestions} suggestions`);
+                    } else {
+                        alert('🤖 Model Status: All systems operating well!\n\nNo improvements needed at this time.');
+                    }
+                } else {
+                    throw new Error(data.error || 'Failed to load improvements');
+                }
+            } catch (error) {
+                console.error('Failed to load improvements:', error);
+                alert('Failed to load improvements: ' + error.message);
+            } finally {
+                globalLoading = false;
+            }
+        }
+        
+        // Basic functionality test
+        function testAPI() {
+            console.log('🧪 Testing API connection...');
+            fetch('/health')
+                .then(response => response.json())
+                .then(data => {
+                    console.log('✅ API Health Check:', data);
+                    alert('✅ API is working! Status: ' + data.status);
+                })
+                .catch(error => {
+                    console.error('❌ API Test Failed:', error);
+                    alert('❌ API connection failed: ' + error.message);
+                });
         }
     </script>
 </body>

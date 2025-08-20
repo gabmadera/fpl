@@ -3,7 +3,14 @@
     "allow": [
       "Bash(python:*)",
       "mcp__sequential-thinking__sequentialthinking",
-      "Bash(curl:*)"
+      "Bash(curl:*)",
+      "Bash(export EMAIL_USER=test@example.com)",
+      "Bash(export ALERT_EMAIL=test@example.com)",
+      "Bash(find:*)",
+      "Bash(rm:*)",
+      "Bash(grep:*)",
+      "Bash(git add:*)",
+      "Bash(lsof:*)"
     ],
     "deny": []
   }
