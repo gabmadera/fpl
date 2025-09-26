@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 from typing import Optional
 from .position_specific_features import PositionSpecificFeatureEngineer
-from .enhanced_fixture_analyzer import EnhancedFixtureAnalyzer
+# Enhanced fixture analyzer removed - using basic fixture features
 
 
 class FeatureEngineer:
@@ -13,7 +13,7 @@ class FeatureEngineer:
         self.form_windows = [3, 5, 10]
         self.difficulty_weights = {'easy': 1.2, 'medium': 1.0, 'hard': 0.8}
         self.position_engineer = PositionSpecificFeatureEngineer()
-        self.enhanced_fixture_analyzer = EnhancedFixtureAnalyzer()
+        # Enhanced fixture analyzer removed - using basic fixture features
 
     def create_features(self, player_data: pd.DataFrame, fixture_data: pd.DataFrame) -> pd.DataFrame:
         df = player_data.copy()
@@ -134,49 +134,31 @@ class FeatureEngineer:
         return df
     
     def _create_enhanced_fixture_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Add position-specific enhanced fixture features"""
-        try:
-            # Get enhanced fixture analysis
-            enhanced_fixtures = self.enhanced_fixture_analyzer.analyze_enhanced_fixtures(gameweeks=5)
-            
-            if 'error' in enhanced_fixtures:
-                return df
-            
-            # Add position-specific fixture difficulties
-            for position in ['GKP', 'DEF', 'MID', 'FWD']:
-                position_mask = df['position'] == position
-                if position_mask.sum() == 0:
-                    continue
-                
-                # Default values
-                df.loc[position_mask, f'{position.lower()}_fixture_difficulty'] = 3
+        """Add position-specific fixture features (simplified version)"""
+        # Add position-specific fixture difficulties with default values
+        for position in ['GKP', 'DEF', 'MID', 'FWD']:
+            position_mask = df['position'] == position
+            if position_mask.sum() == 0:
+                continue
+
+            # Use existing fixture difficulty as base, with position adjustments
+            base_difficulty = df.loc[position_mask, 'opp_difficulty'] if 'opp_difficulty' in df.columns else 3
+
+            # Position-specific adjustments
+            if position == 'DEF':
+                df.loc[position_mask, f'{position.lower()}_fixture_difficulty'] = base_difficulty * 0.9  # Defenders prefer easier fixtures
+                df.loc[position_mask, f'{position.lower()}_clean_sheet_prob'] = np.where(base_difficulty <= 2, 0.4, 0.2)
+            elif position == 'GKP':
+                df.loc[position_mask, f'{position.lower()}_fixture_difficulty'] = base_difficulty * 0.85
+                df.loc[position_mask, f'{position.lower()}_clean_sheet_prob'] = np.where(base_difficulty <= 2, 0.45, 0.25)
+            else:
+                df.loc[position_mask, f'{position.lower()}_fixture_difficulty'] = base_difficulty
                 df.loc[position_mask, f'{position.lower()}_clean_sheet_prob'] = 0.3
-                df.loc[position_mask, f'{position.lower()}_expected_goals'] = 1.5
-            
-            # Try to map team difficulties to players
-            if 'team_id' in df.columns:
-                for gw_data in enhanced_fixtures.values():
-                    if isinstance(gw_data, dict):
-                        for team_id, team_fixtures in gw_data.items():
-                            if isinstance(team_fixtures, dict) and 'difficulties' in team_fixtures:
-                                team_mask = df['team_id'] == team_id
-                                
-                                for position, difficulty in team_fixtures['difficulties'].items():
-                                    pos_mask = team_mask & (df['position'] == position)
-                                    if pos_mask.sum() > 0:
-                                        df.loc[pos_mask, f'{position.lower()}_fixture_difficulty'] = difficulty
-                                        
-                                        if 'clean_sheet_probability' in team_fixtures:
-                                            df.loc[pos_mask, f'{position.lower()}_clean_sheet_prob'] = team_fixtures['clean_sheet_probability']
-                                        
-                                        if 'expected_goals' in team_fixtures:
-                                            df.loc[pos_mask, f'{position.lower()}_expected_goals'] = team_fixtures['expected_goals']
-            
-            return df
-            
-        except Exception as e:
-            # Fallback: return original df if enhanced fixture analysis fails
-            return df
+
+            # Expected goals based on fixture difficulty
+            df.loc[position_mask, f'{position.lower()}_expected_goals'] = np.where(base_difficulty >= 4, 1.2, 1.8)
+
+        return df
     
     def _create_value_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """Create value-based features for optimization"""

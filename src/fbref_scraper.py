@@ -5,6 +5,7 @@ import time
 import requests
 import pandas as pd
 from bs4 import BeautifulSoup
+from io import StringIO
 from .config import config
 
 
@@ -34,7 +35,7 @@ class FBRefScraper:
                 pass
         combined = "\n".join(html_parts)
         try:
-            tables = pd.read_html(combined)
+            tables = pd.read_html(StringIO(combined))
         except ValueError:
             tables = []
         return tables[0] if tables else pd.DataFrame()

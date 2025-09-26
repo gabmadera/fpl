@@ -1,0 +1,848 @@
+"""
+Aggressive Accuracy Optimizer for Maximum FPL Performance
+Implements dynamic model weighting, captaincy optimization, and differential strategies
+"""
+
+from __future__ import annotations
+
+import pandas as pd
+import numpy as np
+import logging
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Dict, List, Any, Optional, Tuple
+from dataclasses import dataclass, asdict
+import json
+from enum import Enum
+
+# ML imports for advanced optimization
+from sklearn.ensemble import VotingRegressor
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import RBF, ConstantKernel
+from sklearn.model_selection import GridSearchCV
+from sklearn.metrics import mean_absolute_error, r2_score
+import scipy.optimize as opt
+
+from .fpl_client import FPLClient
+from .cache_manager import CacheManager
+
+
+class OptimizationStrategy(Enum):
+    CONSERVATIVE = "conservative"  # Lower risk, steady gains
+    BALANCED = "balanced"         # Moderate risk/reward
+    AGGRESSIVE = "aggressive"     # Higher risk, maximum returns
+    MAXIMUM = "maximum"          # All-out attack on accuracy
+
+
+@dataclass
+class OptimizerMetrics:
+    """Track optimizer performance"""
+    timestamp: datetime
+    strategy: OptimizationStrategy
+    accuracy_target: float
+    current_accuracy: float
+    captaincy_success_rate: float
+    differential_success_rate: float
+    value_pick_accuracy: float
+    model_confidence: float
+    recommendations_made: int
+    high_risk_picks: int
+
+
+class AggressiveAccuracyOptimizer:
+    """
+    Advanced optimizer for maximum FPL accuracy with aggressive strategies
+    """
+
+    def __init__(self, strategy: OptimizationStrategy = OptimizationStrategy.MAXIMUM):
+        self.logger = logging.getLogger(__name__)
+        self.fpl = FPLClient()
+        self.cache_manager = CacheManager()
+        self.strategy = strategy
+
+        # Performance tracking
+        self.metrics_history: List[OptimizerMetrics] = []
+
+        # Strategy configurations
+        self.strategy_configs = {
+            OptimizationStrategy.CONSERVATIVE: {
+                'differential_threshold': 0.25,    # 25% ownership threshold
+                'risk_multiplier': 0.8,
+                'captain_confidence_min': 0.8,
+                'value_weight': 1.2,
+                'form_weight': 1.0,
+                'fixture_weight': 1.1,
+            },
+            OptimizationStrategy.BALANCED: {
+                'differential_threshold': 0.15,    # 15% ownership threshold
+                'risk_multiplier': 1.0,
+                'captain_confidence_min': 0.7,
+                'value_weight': 1.1,
+                'form_weight': 1.1,
+                'fixture_weight': 1.0,
+            },
+            OptimizationStrategy.AGGRESSIVE: {
+                'differential_threshold': 0.10,    # 10% ownership threshold
+                'risk_multiplier': 1.3,
+                'captain_confidence_min': 0.6,
+                'value_weight': 1.0,
+                'form_weight': 1.3,
+                'fixture_weight': 0.9,
+            },
+            OptimizationStrategy.MAXIMUM: {
+                'differential_threshold': 0.05,    # 5% ownership threshold
+                'risk_multiplier': 1.5,
+                'captain_confidence_min': 0.5,
+                'value_weight': 0.9,
+                'form_weight': 1.5,
+                'fixture_weight': 0.8,
+            }
+        }
+
+        # File paths
+        self.metrics_file = Path("data/optimizer/metrics_history.jsonl")
+        self.config_file = Path("data/optimizer/optimizer_config.json")
+        self.metrics_file.parent.mkdir(parents=True, exist_ok=True)
+
+        # Setup logging
+        self._setup_logging()
+
+        # Load previous metrics
+        self._load_metrics_history()
+
+    def _load_metrics_history(self):
+                n_estimators=500,
+                max_depth=8,
+                learning_rate=0.05,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                random_state=42
+            ),
+            'random_forest': RandomForestRegressor(
+                n_estimators=300,
+                max_depth=12,
+                min_samples_split=5,
+                min_samples_leaf=2,
+                random_state=42
+            ),
+            'gradient_boost': GradientBoostingRegressor(
+                n_estimators=300,
+                max_depth=8,
+                learning_rate=0.1,
+                subsample=0.8,
+                random_state=42
+            )
+        }
+
+        # Dynamic ensemble weights
+        self.ensemble_weights = {
+            'xgboost': 0.35,
+            'lightgbm': 0.30,
+            'random_forest': 0.20,
+            'gradient_boost': 0.15
+        }
+
+        # Accuracy tracking
+        self.accuracy_history = []
+        self.model_performance = {}
+
+        # Create directories
+        Path("models/aggressive_ensemble").mkdir(parents=True, exist_ok=True)
+        Path("data/accuracy_optimization").mkdir(parents=True, exist_ok=True)
+
+    def immediate_post_gameweek_retrain(self, completed_gameweek: int) -> Dict[str, Any]:
+        """
+        Trigger immediate aggressive retraining after each gameweek completes.
+        This is the core of the weekly retraining strategy.
+        """
+        self.logger.info(f"🚀 Starting aggressive post-GW{completed_gameweek} retraining...")
+
+        try:
+            # Step 1: Collect actual results immediately
+            actual_results = self.retrainer.collect_gameweek_results(completed_gameweek)
+            if actual_results is None:
+                return {"status": "failed", "reason": "No gameweek results available"}
+
+            # Step 2: Evaluate current model performance
+            performance_metrics = self._evaluate_current_accuracy(completed_gameweek)
+
+            # Step 3: Determine retraining intensity based on performance
+            retrain_intensity = self._determine_retrain_intensity(performance_metrics)
+
+            # Step 4: Execute aggressive retraining
+            retrain_result = self._execute_aggressive_retrain(
+                completed_gameweek,
+                actual_results,
+                retrain_intensity
+            )
+
+            # Step 5: Optimize ensemble weights based on recent performance
+            weight_optimization = self._optimize_ensemble_weights(completed_gameweek)
+
+            # Step 6: Generate next gameweek predictions with optimized models
+            next_gw = completed_gameweek + 1
+            predictions = self._generate_aggressive_predictions(next_gw)
+
+            result = {
+                "status": "success",
+                "completed_gameweek": completed_gameweek,
+                "next_gameweek": next_gw,
+                "retrain_intensity": retrain_intensity,
+                "performance_metrics": performance_metrics,
+                "retrain_result": retrain_result,
+                "weight_optimization": weight_optimization,
+                "predictions_generated": len(predictions) if predictions is not None else 0,
+                "timestamp": datetime.now().isoformat()
+            }
+
+            # Save retraining log
+            self._save_retrain_log(result)
+
+            return result
+
+        except Exception as e:
+            self.logger.error(f"Aggressive retraining failed for GW{completed_gameweek}: {e}")
+            return {"status": "failed", "error": str(e)}
+
+    def _evaluate_current_accuracy(self, gameweek: int) -> Dict[str, float]:
+        """Evaluate current model accuracy with detailed metrics"""
+
+        try:
+            # Get recent accuracy data
+            recent_results = self.accuracy_tracker.results_history[-5:] if self.accuracy_tracker.results_history else []
+
+            if len(recent_results) < 2:
+                return {"accuracy": 0.0, "confidence": "low", "sample_size": 0}
+
+            # Calculate multiple accuracy metrics
+            point_errors = []
+            captain_success = []
+            prediction_stability = []
+
+            for result in recent_results:
+                # Point prediction accuracy
+                predicted = result.team_selection.predicted_points
+                actual = result.actual_team_points
+                if actual > 0:
+                    accuracy = max(0, 100 - (abs(predicted - actual) / actual * 100))
+                    point_errors.append(accuracy)
+
+                # Captain success rate
+                captain_points = result.actual_captain_points
+                captain_success.append(1 if captain_points >= 8 else 0)
+
+                # Prediction stability (consistency)
+                if hasattr(result, 'prediction_accuracy'):
+                    mae = result.prediction_accuracy.get('mae', 0)
+                    prediction_stability.append(max(0, 100 - mae * 10))
+
+            # Overall metrics
+            avg_accuracy = np.mean(point_errors) if point_errors else 0
+            captain_rate = np.mean(captain_success) * 100 if captain_success else 0
+            stability = np.mean(prediction_stability) if prediction_stability else 0
+
+            # Trend analysis
+            if len(point_errors) >= 3:
+                recent_trend = np.mean(point_errors[-2:]) - np.mean(point_errors[:-2])
+            else:
+                recent_trend = 0
+
+            return {
+                "accuracy": float(avg_accuracy),
+                "captain_success_rate": float(captain_rate),
+                "prediction_stability": float(stability),
+                "accuracy_trend": float(recent_trend),
+                "sample_size": len(recent_results),
+                "confidence": "high" if len(recent_results) >= 5 else "medium"
+            }
+
+        except Exception as e:
+            self.logger.error(f"Accuracy evaluation failed: {e}")
+            return {"accuracy": 0.0, "error": str(e)}
+
+    def _determine_retrain_intensity(self, performance: Dict[str, float]) -> str:
+        """Determine how aggressive the retraining should be based on performance"""
+
+        accuracy = performance.get("accuracy", 0)
+        captain_rate = performance.get("captain_success_rate", 0)
+        trend = performance.get("accuracy_trend", 0)
+
+        # Aggressive retraining conditions
+        if accuracy < self.aggressive_threshold:
+            return "emergency"  # Full model rebuild with hyperparameter optimization
+        elif accuracy < self.target_accuracy:
+            return "aggressive"  # Full ensemble retrain
+        elif captain_rate < 70:
+            return "focused"    # Focus on captaincy and high-value predictions
+        elif trend < -5:
+            return "corrective" # Address declining performance
+        else:
+            return "incremental" # Light optimization
+
+    def _execute_aggressive_retrain(self, gameweek: int, actual_results: pd.DataFrame,
+                                  intensity: str) -> Dict[str, Any]:
+        """Execute retraining with specified intensity level"""
+
+        try:
+            # Build comprehensive training dataset
+            X, y = self.data_prep.build_training_table()
+
+            if X.empty or y.empty:
+                return {"status": "failed", "reason": "No training data"}
+
+            # Add gameweek-specific features for recent performance weighting
+            X = self._add_recency_features(X, gameweek)
+
+            # Weight recent samples more heavily
+            sample_weights = self._calculate_sample_weights(X, gameweek)
+
+            retrain_results = {}
+
+            if intensity == "emergency":
+                # Full hyperparameter optimization and model rebuild
+                retrain_results = self._emergency_retrain(X, y, sample_weights)
+
+            elif intensity == "aggressive":
+                # Retrain all ensemble models
+                retrain_results = self._aggressive_ensemble_retrain(X, y, sample_weights)
+
+            elif intensity == "focused":
+                # Focus on captain and high-value player prediction improvements
+                retrain_results = self._focused_retrain(X, y, sample_weights, actual_results)
+
+            elif intensity == "corrective":
+                # Address specific performance issues
+                retrain_results = self._corrective_retrain(X, y, sample_weights)
+
+            else:  # incremental
+                # Light model updates
+                retrain_results = self._incremental_retrain(X, y, sample_weights)
+
+            # Save updated models
+            self._save_ensemble_models(gameweek)
+
+            retrain_results["intensity"] = intensity
+            retrain_results["training_samples"] = len(X)
+
+            return retrain_results
+
+        except Exception as e:
+            self.logger.error(f"Retrain execution failed: {e}")
+            return {"status": "failed", "error": str(e)}
+
+    def _emergency_retrain(self, X: pd.DataFrame, y: pd.Series,
+                          sample_weights: np.ndarray) -> Dict[str, Any]:
+        """Emergency full model rebuild with hyperparameter optimization"""
+
+        self.logger.info("🔥 EMERGENCY RETRAIN: Full model rebuild with hyperparameter optimization")
+
+        # Hyperparameter optimization for XGBoost (primary model)
+        best_xgb_params = self._optimize_xgb_hyperparameters(X, y, sample_weights)
+
+        # Update primary model with optimized parameters
+        self.ensemble_models['xgboost'] = xgb.XGBRegressor(**best_xgb_params)
+
+        # Retrain all models with optimized parameters
+        model_scores = {}
+        for name, model in self.ensemble_models.items():
+            try:
+                # Fit with sample weights
+                if hasattr(model, 'fit') and 'sample_weight' in model.fit.__code__.co_varnames:
+                    model.fit(X, y, sample_weight=sample_weights)
+                else:
+                    model.fit(X, y)
+
+                # Cross-validation score
+                cv_score = cross_val_score(model, X, y, cv=5, scoring='neg_mean_absolute_error')
+                model_scores[name] = -cv_score.mean()
+
+            except Exception as e:
+                self.logger.error(f"Emergency retrain failed for {name}: {e}")
+                model_scores[name] = float('inf')
+
+        # Update ensemble weights based on performance
+        self._update_ensemble_weights_from_scores(model_scores)
+
+        return {
+            "status": "success",
+            "type": "emergency",
+            "model_scores": model_scores,
+            "best_xgb_params": best_xgb_params,
+            "new_ensemble_weights": self.ensemble_weights.copy()
+        }
+
+    def _aggressive_ensemble_retrain(self, X: pd.DataFrame, y: pd.Series,
+                                   sample_weights: np.ndarray) -> Dict[str, Any]:
+        """Aggressive retraining of all ensemble models"""
+
+        self.logger.info("💪 AGGRESSIVE RETRAIN: Full ensemble retraining")
+
+        model_scores = {}
+        for name, model in self.ensemble_models.items():
+            try:
+                # Enhanced training for aggressive mode
+                if name == 'xgboost':
+                    # Increase XGBoost complexity for aggressive mode
+                    model.set_params(
+                        n_estimators=800,
+                        max_depth=10,
+                        learning_rate=0.03
+                    )
+                elif name == 'lightgbm':
+                    model.set_params(
+                        n_estimators=800,
+                        max_depth=10,
+                        learning_rate=0.03
+                    )
+
+                # Train with sample weights
+                if hasattr(model, 'fit') and 'sample_weight' in model.fit.__code__.co_varnames:
+                    model.fit(X, y, sample_weight=sample_weights)
+                else:
+                    model.fit(X, y)
+
+                # Evaluate performance
+                cv_score = cross_val_score(model, X, y, cv=5, scoring='neg_mean_absolute_error')
+                model_scores[name] = -cv_score.mean()
+
+            except Exception as e:
+                self.logger.error(f"Aggressive retrain failed for {name}: {e}")
+                model_scores[name] = float('inf')
+
+        return {
+            "status": "success",
+            "type": "aggressive",
+            "model_scores": model_scores
+        }
+
+    def _focused_retrain(self, X: pd.DataFrame, y: pd.Series, sample_weights: np.ndarray,
+                        actual_results: pd.DataFrame) -> Dict[str, Any]:
+        """Focused retraining for captain and high-value predictions"""
+
+        self.logger.info("🎯 FOCUSED RETRAIN: Optimizing captain and high-value predictions")
+
+        # Create enhanced dataset focusing on high-performing players
+        high_value_mask = y >= 8.0  # Focus on players likely to score 8+ points
+
+        if high_value_mask.sum() > 50:  # Ensure sufficient samples
+            X_focused = X[high_value_mask]
+            y_focused = y[high_value_mask]
+            weights_focused = sample_weights[high_value_mask] * 1.5  # Extra weight
+
+            # Retrain primary models on focused dataset
+            focused_scores = {}
+            for name in ['xgboost', 'lightgbm']:  # Focus on best performers
+                model = self.ensemble_models[name]
+                try:
+                    if hasattr(model, 'fit') and 'sample_weight' in model.fit.__code__.co_varnames:
+                        model.fit(X_focused, y_focused, sample_weight=weights_focused)
+                    else:
+                        model.fit(X_focused, y_focused)
+
+                    cv_score = cross_val_score(model, X_focused, y_focused, cv=3, scoring='neg_mean_absolute_error')
+                    focused_scores[name] = -cv_score.mean()
+
+                except Exception as e:
+                    self.logger.error(f"Focused retrain failed for {name}: {e}")
+                    focused_scores[name] = float('inf')
+
+            return {
+                "status": "success",
+                "type": "focused",
+                "focused_samples": len(X_focused),
+                "focused_scores": focused_scores
+            }
+        else:
+            # Fall back to aggressive retrain if not enough high-value samples
+            return self._aggressive_ensemble_retrain(X, y, sample_weights)
+
+    def _corrective_retrain(self, X: pd.DataFrame, y: pd.Series,
+                           sample_weights: np.ndarray) -> Dict[str, Any]:
+        """Corrective retraining to address declining performance"""
+
+        self.logger.info("🔧 CORRECTIVE RETRAIN: Addressing performance decline")
+
+        # Increase regularization to prevent overfitting
+        corrective_models = {
+            'xgboost': xgb.XGBRegressor(
+                n_estimators=400,
+                max_depth=6,  # Reduced complexity
+                learning_rate=0.08,
+                reg_alpha=0.1,  # L1 regularization
+                reg_lambda=0.1,  # L2 regularization
+                subsample=0.7,
+                colsample_bytree=0.7,
+                random_state=42
+            ),
+            'lightgbm': lgb.LGBMRegressor(
+                n_estimators=400,
+                max_depth=6,
+                learning_rate=0.08,
+                reg_alpha=0.1,
+                reg_lambda=0.1,
+                subsample=0.7,
+                colsample_bytree=0.7,
+                random_state=42
+            )
+        }
+
+        corrective_scores = {}
+        for name, model in corrective_models.items():
+            try:
+                if hasattr(model, 'fit') and 'sample_weight' in model.fit.__code__.co_varnames:
+                    model.fit(X, y, sample_weight=sample_weights)
+                else:
+                    model.fit(X, y)
+
+                cv_score = cross_val_score(model, X, y, cv=5, scoring='neg_mean_absolute_error')
+                corrective_scores[name] = -cv_score.mean()
+
+                # Update ensemble model
+                self.ensemble_models[name] = model
+
+            except Exception as e:
+                self.logger.error(f"Corrective retrain failed for {name}: {e}")
+                corrective_scores[name] = float('inf')
+
+        return {
+            "status": "success",
+            "type": "corrective",
+            "corrective_scores": corrective_scores
+        }
+
+    def _incremental_retrain(self, X: pd.DataFrame, y: pd.Series,
+                            sample_weights: np.ndarray) -> Dict[str, Any]:
+        """Light incremental model updates"""
+
+        self.logger.info("📈 INCREMENTAL RETRAIN: Light model optimization")
+
+        # Just retrain XGBoost and LightGBM with recent data emphasis
+        incremental_scores = {}
+        for name in ['xgboost', 'lightgbm']:
+            model = self.ensemble_models[name]
+            try:
+                if hasattr(model, 'fit') and 'sample_weight' in model.fit.__code__.co_varnames:
+                    model.fit(X, y, sample_weight=sample_weights)
+                else:
+                    model.fit(X, y)
+
+                cv_score = cross_val_score(model, X, y, cv=3, scoring='neg_mean_absolute_error')
+                incremental_scores[name] = -cv_score.mean()
+
+            except Exception as e:
+                self.logger.error(f"Incremental retrain failed for {name}: {e}")
+                incremental_scores[name] = float('inf')
+
+        return {
+            "status": "success",
+            "type": "incremental",
+            "incremental_scores": incremental_scores
+        }
+
+    def _optimize_xgb_hyperparameters(self, X: pd.DataFrame, y: pd.Series,
+                                     sample_weights: np.ndarray) -> Dict[str, Any]:
+        """Optimize XGBoost hyperparameters for maximum accuracy"""
+
+        from sklearn.model_selection import RandomizedSearchCV
+
+        param_distributions = {
+            'n_estimators': [400, 600, 800, 1000],
+            'max_depth': [6, 8, 10, 12],
+            'learning_rate': [0.01, 0.03, 0.05, 0.08, 0.1],
+            'subsample': [0.7, 0.8, 0.9],
+            'colsample_bytree': [0.7, 0.8, 0.9],
+            'reg_alpha': [0, 0.01, 0.1],
+            'reg_lambda': [0, 0.01, 0.1]
+        }
+
+        xgb_base = xgb.XGBRegressor(random_state=42)
+
+        # Randomized search for efficiency
+        search = RandomizedSearchCV(
+            xgb_base,
+            param_distributions,
+            n_iter=20,  # Limited for speed
+            cv=3,
+            scoring='neg_mean_absolute_error',
+            random_state=42,
+            n_jobs=-1
+        )
+
+        search.fit(X, y, sample_weight=sample_weights)
+
+        return search.best_params_
+
+    def _add_recency_features(self, X: pd.DataFrame, current_gameweek: int) -> pd.DataFrame:
+        """Add features that emphasize recent performance"""
+
+        # Add recency weights based on gameweek
+        if 'gameweek' in X.columns:
+            X['recency_weight'] = np.exp(-(current_gameweek - X['gameweek']) / 5.0)
+            X['recent_performance'] = X.get('total_points', 0) * X['recency_weight']
+
+        return X
+
+    def _calculate_sample_weights(self, X: pd.DataFrame, current_gameweek: int) -> np.ndarray:
+        """Calculate sample weights emphasizing recent gameweeks"""
+
+        if 'gameweek' in X.columns:
+            # Exponential decay for older gameweeks
+            recency = np.exp(-(current_gameweek - X['gameweek']) / 3.0)
+            return np.clip(recency, 0.1, 3.0)  # Limit weight range
+        else:
+            return np.ones(len(X))
+
+    def _optimize_ensemble_weights(self, gameweek: int) -> Dict[str, Any]:
+        """Optimize ensemble weights based on recent model performance"""
+
+        try:
+            # Load recent performance data
+            performance_data = self._load_recent_model_performance(gameweek)
+
+            if not performance_data:
+                return {"status": "no_data", "weights": self.ensemble_weights}
+
+            # Calculate performance-based weights
+            model_accuracies = {}
+            for model_name in self.ensemble_models.keys():
+                recent_scores = [p.get(model_name, 0) for p in performance_data[-3:]]
+                if recent_scores:
+                    # Higher accuracy = lower MAE score
+                    avg_mae = np.mean([abs(s) for s in recent_scores])
+                    model_accuracies[model_name] = 1.0 / (avg_mae + 0.1)  # Avoid division by zero
+                else:
+                    model_accuracies[model_name] = 1.0
+
+            # Normalize weights
+            total_accuracy = sum(model_accuracies.values())
+            if total_accuracy > 0:
+                new_weights = {name: acc / total_accuracy for name, acc in model_accuracies.items()}
+
+                # Smooth transition (blend 70% new, 30% old)
+                final_weights = {}
+                for name in self.ensemble_weights.keys():
+                    old_weight = self.ensemble_weights[name]
+                    new_weight = new_weights.get(name, 0.25)
+                    final_weights[name] = 0.7 * new_weight + 0.3 * old_weight
+
+                self.ensemble_weights = final_weights
+
+                return {
+                    "status": "optimized",
+                    "old_weights": self.ensemble_weights,
+                    "new_weights": final_weights,
+                    "model_accuracies": model_accuracies
+                }
+
+            return {"status": "no_change", "weights": self.ensemble_weights}
+
+        except Exception as e:
+            self.logger.error(f"Weight optimization failed: {e}")
+            return {"status": "failed", "error": str(e)}
+
+    def _generate_aggressive_predictions(self, gameweek: int) -> Optional[pd.DataFrame]:
+        """Generate predictions using optimized ensemble for maximum accuracy"""
+
+        try:
+            # Get base predictions from MLPipeline
+            base_predictions = MLPipeline().predict_current()
+
+            if base_predictions.empty:
+                return None
+
+            # Generate ensemble predictions
+            X = base_predictions.drop(['predicted_points'], axis=1, errors='ignore')
+
+            ensemble_predictions = np.zeros(len(X))
+            successful_models = 0
+
+            for model_name, model in self.ensemble_models.items():
+                try:
+                    if hasattr(model, 'predict'):
+                        model_pred = model.predict(X)
+                        weight = self.ensemble_weights.get(model_name, 0.25)
+                        ensemble_predictions += weight * model_pred
+                        successful_models += 1
+                except Exception as e:
+                    self.logger.warning(f"Model {model_name} prediction failed: {e}")
+                    continue
+
+            if successful_models == 0:
+                return base_predictions
+
+            # Apply aggressive scaling for high-confidence predictions
+            ensemble_predictions = self._apply_aggressive_scaling(ensemble_predictions, X)
+
+            # Update predictions
+            base_predictions['predicted_points'] = ensemble_predictions
+            base_predictions['confidence_level'] = self._calculate_prediction_confidence(ensemble_predictions, X)
+            base_predictions['gameweek'] = gameweek
+
+            # Save predictions for next evaluation
+            pred_file = f"data/accuracy_optimization/gw{gameweek}_aggressive_predictions.csv"
+            base_predictions.to_csv(pred_file, index=False)
+
+            return base_predictions
+
+        except Exception as e:
+            self.logger.error(f"Aggressive prediction generation failed: {e}")
+            return None
+
+    def _apply_aggressive_scaling(self, predictions: np.ndarray, features: pd.DataFrame) -> np.ndarray:
+        """Apply aggressive scaling to boost high-confidence predictions"""
+
+        # Boost predictions for players with strong recent form
+        if 'recent_points' in features.columns:
+            recent_form = features['recent_points'].fillna(0)
+            form_multiplier = 1.0 + 0.1 * (recent_form - recent_form.mean()) / recent_form.std()
+            form_multiplier = np.clip(form_multiplier, 0.8, 1.3)
+            predictions = predictions * form_multiplier
+
+        # Boost predictions for players in good fixtures
+        if 'fdr' in features.columns:
+            fdr = features['fdr'].fillna(3)
+            fixture_boost = 1.0 + 0.05 * (3 - fdr)  # Better fixtures (lower FDR) get boost
+            predictions = predictions * fixture_boost
+
+        return np.clip(predictions, 0, 25)  # Reasonable FPL point range
+
+    def _calculate_prediction_confidence(self, predictions: np.ndarray, features: pd.DataFrame) -> np.ndarray:
+        """Calculate confidence levels for predictions"""
+
+        # Base confidence from prediction magnitude
+        base_confidence = np.clip(predictions / 15.0, 0.1, 1.0)
+
+        # Adjust for data quality indicators
+        if 'minutes' in features.columns:
+            minutes = features['minutes'].fillna(0)
+            playing_confidence = np.clip(minutes / 90.0, 0.5, 1.0)
+            base_confidence *= playing_confidence
+
+        return base_confidence
+
+    def _update_ensemble_weights_from_scores(self, model_scores: Dict[str, float]):
+        """Update ensemble weights based on cross-validation scores"""
+
+        # Convert MAE scores to accuracy weights (lower MAE = higher weight)
+        valid_scores = {name: score for name, score in model_scores.items() if score != float('inf')}
+
+        if not valid_scores:
+            return
+
+        # Invert scores (lower MAE = better)
+        max_score = max(valid_scores.values())
+        accuracy_weights = {name: (max_score - score + 0.1) for name, score in valid_scores.items()}
+
+        # Normalize
+        total_weight = sum(accuracy_weights.values())
+        if total_weight > 0:
+            self.ensemble_weights = {name: weight / total_weight for name, weight in accuracy_weights.items()}
+
+    def _save_ensemble_models(self, gameweek: int):
+        """Save all ensemble models with metadata"""
+
+        model_data = {
+            'gameweek': gameweek,
+            'timestamp': datetime.now().isoformat(),
+            'ensemble_weights': self.ensemble_weights,
+            'models': {},
+            'target_accuracy': self.target_accuracy
+        }
+
+        # Save individual models
+        for name, model in self.ensemble_models.items():
+            try:
+                model_file = f"models/aggressive_ensemble/{name}_gw{gameweek}.pkl"
+                joblib.dump(model, model_file)
+                model_data['models'][name] = model_file
+            except Exception as e:
+                self.logger.error(f"Failed to save {name} model: {e}")
+
+        # Save metadata
+        metadata_file = f"models/aggressive_ensemble/ensemble_metadata_gw{gameweek}.json"
+        with open(metadata_file, 'w') as f:
+            json.dump(model_data, f, indent=2)
+
+    def _save_retrain_log(self, result: Dict[str, Any]):
+        """Save detailed retraining log for analysis"""
+
+        log_file = Path("data/accuracy_optimization/retrain_log.jsonl")
+
+        with open(log_file, 'a') as f:
+            f.write(json.dumps(result) + '\n')
+
+    def _load_recent_model_performance(self, gameweek: int, lookback: int = 5) -> List[Dict]:
+        """Load recent model performance data"""
+
+        performance_data = []
+        for gw in range(max(1, gameweek - lookback), gameweek):
+            try:
+                eval_file = f"data/weekly_performance/gw{gw}_evaluation.csv"
+                if Path(eval_file).exists():
+                    df = pd.read_csv(eval_file)
+                    if not df.empty:
+                        performance_data.append(df.iloc[0].to_dict())
+            except Exception:
+                continue
+
+        return performance_data
+
+    def get_accuracy_dashboard(self) -> Dict[str, Any]:
+        """Get comprehensive accuracy dashboard for monitoring"""
+
+        try:
+            # Recent performance
+            recent_performance = self._evaluate_current_accuracy(0)
+
+            # Ensemble status
+            ensemble_status = {
+                'weights': self.ensemble_weights,
+                'models_loaded': len(self.ensemble_models),
+                'target_accuracy': self.target_accuracy
+            }
+
+            # Historical accuracy trend
+            history = self.accuracy_tracker.get_comprehensive_report(10)
+
+            return {
+                'current_performance': recent_performance,
+                'ensemble_status': ensemble_status,
+                'historical_report': history,
+                'recommendations': self._get_accuracy_recommendations(recent_performance)
+            }
+
+        except Exception as e:
+            return {'error': str(e)}
+
+    def _get_accuracy_recommendations(self, performance: Dict[str, float]) -> List[str]:
+        """Get specific recommendations for improving accuracy"""
+
+        recommendations = []
+        accuracy = performance.get('accuracy', 0)
+        captain_rate = performance.get('captain_success_rate', 0)
+
+        if accuracy < 60:
+            recommendations.append("🚨 CRITICAL: Accuracy below 60% - Emergency retrain recommended")
+        elif accuracy < 70:
+            recommendations.append("⚠️  Accuracy below target - Aggressive retrain needed")
+
+        if captain_rate < 70:
+            recommendations.append("👑 Captain selection needs improvement - Focus on captaincy logic")
+
+        if performance.get('accuracy_trend', 0) < -5:
+            recommendations.append("📉 Declining accuracy trend - Investigate overfitting")
+
+        if accuracy >= 75:
+            recommendations.append("✅ Excellent accuracy achieved - Maintain current approach")
+
+        return recommendations or ["📊 Performance analysis in progress"]
+
+
+# Helper function to schedule automatic retraining
+def schedule_post_gameweek_retraining(completed_gameweek: int) -> Dict[str, Any]:
+    """
+    Entry point for automatic post-gameweek retraining.
+    Call this immediately after each gameweek completes.
+    """
+    optimizer = AggressiveAccuracyOptimizer()
+    return optimizer.immediate_post_gameweek_retrain(completed_gameweek)

@@ -7,14 +7,14 @@ import pandas as pd
 
 from .fpl_client import FPLClient
 from .fbref_scraper import FBRefScraper
-from .news_scraper import NewsScraper
+# News scraper removed - functionality disabled
 
 
 class DataPipeline:
     def __init__(self) -> None:
         self.fpl = FPLClient()
         self.fbref = FBRefScraper()
-        self.news = NewsScraper()
+        # News scraper removed - functionality disabled
         Path("data/raw").mkdir(parents=True, exist_ok=True)
 
     def collect_fpl_snapshots(self) -> dict[str, str]:
@@ -39,9 +39,10 @@ class DataPipeline:
         return {"x_rows": 0 if x_stats is None else len(x_stats), "d_rows": 0 if def_stats is None else len(def_stats), "x_path": x_path, "d_path": d_path}
 
     def scrape_news(self) -> str:
+        """News scraping disabled - returns empty result"""
         ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        items = self.news.fetch_latest(keywords=["injury", "suspended", "doubt", "fit", "AFCON", "hamstring"])  # simple keywords
-        return self._write_json(f"data/raw/news_{ts}.json", items)
+        empty_news = {"articles": [], "timestamp": ts, "status": "disabled"}
+        return self._write_json(f"data/raw/news_{ts}.json", empty_news)
 
     def _write_json(self, path: str, data) -> str:
         with open(path, "w") as f:

@@ -10,7 +10,8 @@
       "Bash(rm:*)",
       "Bash(grep:*)",
       "Bash(git add:*)",
-      "Bash(lsof:*)"
+      "Bash(lsof:*)",
+      "Bash(pkill:*)"
     ],
     "deny": []
   }

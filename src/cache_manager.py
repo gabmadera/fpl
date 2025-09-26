@@ -16,15 +16,18 @@ class CacheManager:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.logger = logging.getLogger(__name__)
         
-        # Cache durations (in hours)
+        # Much more aggressive cache durations to avoid rate limits
         self.cache_durations = {
-            'predictions': 2,        # 2 hours for predictions
-            'team_suggestions': 1,   # 1 hour for team suggestions
-            'fixtures': 6,          # 6 hours for fixture data
-            'transfer_suggestions': 2,  # 2 hours for transfer suggestions
-            'actual_points': 24,    # 24 hours for actual points
-            'accuracy_report': 1,   # 1 hour for accuracy reports
-            'performance_history': 12  # 12 hours for performance history
+            'predictions': 6,        # 6 hours for predictions (was 2)
+            'team_suggestions': 12,  # 12 hours for team suggestions (was 1)
+            'fixtures': 24,         # 24 hours for fixture data (was 6)
+            'transfer_suggestions': 12, # 12 hours for transfer suggestions (was 2)
+            'actual_points': 48,    # 48 hours for actual points (was 24)
+            'accuracy_report': 12,  # 12 hours for accuracy reports (was 1)
+            'performance_history': 24, # 24 hours for performance history (was 12)
+            'bootstrap_static': 24, # 24 hours for bootstrap data (NEW)
+            'gameweek_status': 6,   # 6 hours for gameweek status (NEW)
+            'real_gw_data': 24,     # 24 hours for real GW data (NEW)
         }
     
     def is_cache_valid(self, cache_type: str, custom_duration: Optional[int] = None) -> bool:

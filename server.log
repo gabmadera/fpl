@@ -1,0 +1,37 @@
+INFO:     Will watch for changes in these directories: ['/Users/gabriel/Code/gabriel/fpl/FPL']
+INFO:     Uvicorn running on http://0.0.0.0:8001 (Press CTRL+C to quit)
+INFO:     Started reloader process [51409] using StatReload
+INFO:     Started server process [51411]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     127.0.0.1:60562 - "GET / HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60598 - "GET / HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60629 - "GET / HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60666 - "GET / HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60701 - "GET / HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60845 - "GET / HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60895 - "GET / HTTP/1.1" 200 OK
+INFO:     127.0.0.1:61105 - "GET / HTTP/1.1" 200 OK
+INFO:     127.0.0.1:61285 - "GET / HTTP/1.1" 200 OK
+INFO:     127.0.0.1:61286 - "GET /.well-known/appspecific/com.chrome.devtools.json HTTP/1.1" 404 Not Found
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [51411]
+INFO:     Stopping reloader process [51409]
+🚀 FPL AI Dashboard - Enhanced Prediction System
+======================================================================
+📈 Target Accuracy: 80%+ (up from previous 55%)
+🔧 Recent Fixes: Prediction scaling, bonus points, validation
+======================================================================
+📁 Working directory: /Users/gabriel/Code/gabriel/fpl/FPL
+🔗 Dashboard URL: http://localhost:8001
+📊 New Features: Prediction validation, enhanced bonus scoring, realistic caps
+======================================================================
+🎯 Quick Start Guide:
+  1. Click 'Generate Team' to create predictions
+  2. Click 'Verify Points' to check accuracy against real FPL data
+  3. Click 'Update Accuracy' to fetch actual points from FPL API
+  4. Use 'Improve Model' to retrain based on actual results
+======================================================================
+🌟 Starting server...

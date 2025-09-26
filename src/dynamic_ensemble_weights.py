@@ -211,22 +211,231 @@ class DynamicEnsembleWeights:
         """Get recent performance for all models"""
         try:
             recent_performance = {'xgb': [], 'rf': [], 'nn': []}
-            
+
             # Get last N gameweeks
             recent_gameweeks = sorted(self.model_performance_history.keys())[-last_n_weeks:]
-            
+
             for gw in recent_gameweeks:
                 gw_performance = self.model_performance_history[gw]
-                
+
                 for model in recent_performance.keys():
                     if model in gw_performance:
                         recent_performance[model].append(gw_performance[model])
-            
+
             return recent_performance
-            
+
         except Exception as e:
             self.logger.error(f"Recent performance retrieval failed: {e}")
             return {'xgb': [], 'rf': [], 'nn': []}
+
+    def update_weights_with_feedback(self, actual_predictions: Dict[str, pd.DataFrame],
+                                   actual_results: pd.DataFrame, gameweek: int) -> Dict[str, float]:
+        """Online learning: Update weights based on actual gameweek results"""
+        try:
+            self.logger.info(f"Updating weights with GW{gameweek} results")
+
+            # Calculate model-specific errors
+            model_errors = {}
+
+            for model_name, predictions in actual_predictions.items():
+                if predictions.empty or actual_results.empty:
+                    continue
+
+                # Align predictions with actual results
+                merged = predictions.merge(actual_results, on='player_id', how='inner')
+                if merged.empty:
+                    continue
+
+                # Calculate MAE for this model
+                pred_col = 'predicted_points' if 'predicted_points' in merged.columns else 'ep_ml'
+                actual_col = 'points' if 'points' in merged.columns else 'actual_points'
+
+                if pred_col in merged.columns and actual_col in merged.columns:
+                    mae = np.mean(np.abs(merged[pred_col] - merged[actual_col]))
+                    model_errors[model_name] = mae
+
+            if not model_errors:
+                self.logger.warning("No model errors calculated - keeping existing weights")
+                return self.current_weights
+
+            # Update performance history
+            self.update_performance_history(model_errors, gameweek)
+
+            # Calculate new weights using exponential moving average
+            new_weights = self._calculate_online_weights(model_errors)
+
+            # Smooth transition (blend with current weights)
+            smoothing_factor = 0.3  # 30% adaptation rate
+            for model in new_weights:
+                if model in self.current_weights:
+                    self.current_weights[model] = (
+                        (1 - smoothing_factor) * self.current_weights[model] +
+                        smoothing_factor * new_weights[model]
+                    )
+
+            # Normalize to ensure sum = 1
+            total_weight = sum(self.current_weights.values())
+            if total_weight > 0:
+                self.current_weights = {k: v/total_weight for k, v in self.current_weights.items()}
+
+            # Save updated weights
+            self._save_weights()
+
+            self.logger.info(f"Updated weights: {self.current_weights}")
+            return self.current_weights.copy()
+
+        except Exception as e:
+            self.logger.error(f"Weight update failed: {e}")
+            return self.current_weights
+
+    def _calculate_online_weights(self, current_errors: Dict[str, float]) -> Dict[str, float]:
+        """Calculate new weights based on inverse error (better models get higher weight)"""
+        try:
+            # Convert errors to inverse weights (lower error = higher weight)
+            inverse_errors = {}
+            for model, error in current_errors.items():
+                # Use inverse of error, with floor to prevent division issues
+                inverse_errors[model] = 1.0 / max(error, 0.1)
+
+            # Normalize to create weights
+            total_inverse = sum(inverse_errors.values())
+            if total_inverse == 0:
+                return self.default_weights.copy()
+
+            new_weights = {model: inv_error/total_inverse
+                          for model, inv_error in inverse_errors.items()}
+
+            # Ensure reasonable bounds (no model should dominate too much)
+            for model in new_weights:
+                new_weights[model] = max(0.05, min(0.85, new_weights[model]))
+
+            # Renormalize after bounds
+            total_weight = sum(new_weights.values())
+            if total_weight > 0:
+                new_weights = {k: v/total_weight for k, v in new_weights.items()}
+
+            return new_weights
+
+        except Exception as e:
+            self.logger.error(f"Online weight calculation failed: {e}")
+            return self.default_weights.copy()
+
+    def get_model_performance_trends(self) -> Dict[str, str]:
+        """Analyze performance trends for each model"""
+        try:
+            trends = {}
+            recent_performance = self.get_recent_performance(last_n_weeks=5)
+
+            for model, performance_list in recent_performance.items():
+                if len(performance_list) < 3:
+                    trends[model] = "insufficient_data"
+                    continue
+
+                # Calculate trend (recent vs older performance)
+                recent_avg = np.mean(performance_list[-2:])  # Last 2 GWs
+                older_avg = np.mean(performance_list[:-2])   # Previous GWs
+
+                if recent_avg < older_avg * 0.95:  # 5% improvement (lower error is better)
+                    trends[model] = "improving"
+                elif recent_avg > older_avg * 1.05:  # 5% worse
+                    trends[model] = "declining"
+                else:
+                    trends[model] = "stable"
+
+            return trends
+
+        except Exception as e:
+            self.logger.error(f"Trend analysis failed: {e}")
+            return {}
+
+    def get_ensemble_confidence(self) -> float:
+        """Calculate confidence in current ensemble weights"""
+        try:
+            # Get recent performance
+            recent_performance = self.get_recent_performance(last_n_weeks=3)
+
+            # Calculate consistency (lower variance = higher confidence)
+            model_variances = []
+            for model, performances in recent_performance.items():
+                if len(performances) >= 2:
+                    variance = np.var(performances)
+                    model_variances.append(variance)
+
+            if not model_variances:
+                return 0.5  # Medium confidence
+
+            # Convert variance to confidence (lower variance = higher confidence)
+            avg_variance = np.mean(model_variances)
+            confidence = max(0.1, min(1.0, 1.0 / (1.0 + avg_variance)))
+
+            return confidence
+
+        except Exception as e:
+            self.logger.error(f"Confidence calculation failed: {e}")
+            return 0.5
+
+    def should_retrain_ensemble(self) -> bool:
+        """Determine if ensemble needs retraining based on performance"""
+        try:
+            confidence = self.get_ensemble_confidence()
+            trends = self.get_model_performance_trends()
+
+            # Retrain if confidence is low
+            if confidence < 0.3:
+                self.logger.info("Recommending retrain: Low confidence")
+                return True
+
+            # Retrain if majority of models are declining
+            declining_models = sum(1 for trend in trends.values() if trend == "declining")
+            if declining_models > len(trends) / 2:
+                self.logger.info("Recommending retrain: Majority models declining")
+                return True
+
+            return False
+
+        except Exception as e:
+            self.logger.error(f"Retrain check failed: {e}")
+            return False
+
+    def generate_weight_report(self) -> str:
+        """Generate a report on current ensemble weights and performance"""
+        try:
+            confidence = self.get_ensemble_confidence()
+            trends = self.get_model_performance_trends()
+
+            report = f"""
+🎯 ENSEMBLE WEIGHTS REPORT
+========================
+
+📊 Current Weights:
+• XGBoost: {self.current_weights.get('xgb', 0):.3f}
+• Random Forest: {self.current_weights.get('rf', 0):.3f}
+• Neural Network: {self.current_weights.get('nn', 0):.3f}
+
+📈 Model Trends (Last 5 GWs):
+"""
+            for model, trend in trends.items():
+                emoji = {"improving": "📈", "declining": "📉", "stable": "➡️", "insufficient_data": "❓"}
+                report += f"• {model.upper()}: {trend} {emoji.get(trend, '')}\n"
+
+            report += f"""
+🎯 Ensemble Confidence: {confidence:.2f}/1.0
+{"🟢 High" if confidence > 0.7 else "🟡 Medium" if confidence > 0.4 else "🔴 Low"}
+
+💡 Recommendations:
+"""
+            if confidence < 0.4:
+                report += "• Consider model retraining - low ensemble confidence\n"
+            if self.should_retrain_ensemble():
+                report += "• Ensemble retraining recommended\n"
+            else:
+                report += "• Current ensemble performing well\n"
+
+            return report
+
+        except Exception as e:
+            self.logger.error(f"Report generation failed: {e}")
+            return "Report generation failed"
     
     def get_position_optimized_weights(self, position: str, 
                                      recent_performance: Dict[str, List[float]] = None) -> Dict[str, float]:

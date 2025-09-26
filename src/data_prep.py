@@ -9,7 +9,7 @@ import pandas as pd
 
 from .feature_engineer import FeatureEngineer
 from .fbref_scraper import FBRefScraper
-from .data_collector import DataCollector
+from .fpl_client import FPLClient
 from .name_matching import PlayerNameMatcher
 from .fpl_client import FPLClient
 from .understat_scraper import UnderstatScraper
@@ -28,7 +28,7 @@ class DataPrep:
         self.engineer = FeatureEngineer()
         Path("data/processed").mkdir(parents=True, exist_ok=True)
         self.fbref = FBRefScraper()
-        self.collector = DataCollector()
+        self.fpl_client = FPLClient()
         self.understat = UnderstatScraper()
 
     def _find_gw_csvs(self) -> List[str]:
@@ -198,7 +198,7 @@ class DataPrep:
         features = self.engineer.create_features(train.rename(columns={"team": "team_id"}), pd.DataFrame())
         # Enrich with FBref expected/defensive aggregates if available via name matching
         try:
-            fpl_bootstrap = self.collector.fetch_fpl_data("bootstrap-static/")
+            fpl_bootstrap = self.fpl_client.get_bootstrap_data()
             players_static = pd.DataFrame(fpl_bootstrap.get("elements", []))
             players_static = players_static.rename(columns={"web_name": "name", "id": "player_id"})
             matcher = PlayerNameMatcher(players_static[["player_id", "name"]])
@@ -222,7 +222,7 @@ class DataPrep:
             # Use previous season as a proxy prior if available
             us = self.understat.get_league_players("EPL", year=2024)
             if not us.empty:
-                fpl_bootstrap = self.collector.fetch_fpl_data("bootstrap-static/")
+                fpl_bootstrap = self.fpl_client.get_bootstrap_data()
                 players_static = pd.DataFrame(fpl_bootstrap.get("elements", []))
                 players_static = players_static.rename(columns={"web_name": "name", "id": "player_id"})
                 matcher = PlayerNameMatcher(players_static[["player_id", "name"]])

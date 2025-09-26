@@ -15,6 +15,8 @@ from .name_matching import PlayerNameMatcher
 from .fbref_scraper import FBRefScraper
 from .understat_scraper import UnderstatScraper
 from .alternative_data_sources import AlternativeDataSources
+from .twitter_news import TwitterNewsClient
+from .enhanced_prediction_model import EnhancedPredictionModel
 
 
 class MLPipeline:
@@ -27,8 +29,16 @@ class MLPipeline:
         self.prep = DataPrep()
         self.fpl = FPLClient()
         self.fbref = FBRefScraper()
+
+        # Enhanced prediction model
+        self.enhanced_model = EnhancedPredictionModel()
         self.understat = UnderstatScraper()
         self.alt_sources = AlternativeDataSources()
+        # Optional Twitter news client (may be disabled if no token)
+        try:
+            self.twitter = TwitterNewsClient()
+        except Exception:
+            self.twitter = None
 
     def prepare_training_data(self) -> pd.DataFrame:
         # Use latest FPL snapshot as current feature base
@@ -145,15 +155,22 @@ class MLPipeline:
                     joined = link.merge(us_selected, on="other_name", how="left")
                     
                     # Enhanced aggregation with recency weighting
-                    numeric_stats = [col for col in available_stats if col != "other_name"]
+                    numeric_stats = [col for col in available_stats if col not in ["name", "other_name"]]
                     if numeric_stats:
-                        # Convert to numeric first
+                        # Convert to numeric first and filter out any remaining non-numeric columns
+                        valid_numeric_stats = []
                         for col in numeric_stats:
                             if col in joined.columns:
                                 joined[col] = pd.to_numeric(joined[col], errors='coerce')
+                                # Only include if it successfully converts to numeric
+                                if joined[col].dtype.kind in 'biufc':  # numeric types
+                                    valid_numeric_stats.append(col)
                         
-                        agg_dict = {col: 'mean' for col in numeric_stats}
-                        agg = joined.groupby("player_id").agg(agg_dict).reset_index()
+                        if valid_numeric_stats:
+                            agg_dict = {col: 'mean' for col in valid_numeric_stats}
+                            agg = joined.groupby("player_id").agg(agg_dict).reset_index()
+                        else:
+                            agg = pd.DataFrame()
                     else:
                         agg = pd.DataFrame()
                     
@@ -212,11 +229,14 @@ class MLPipeline:
                             blended = w_cur.fillna(0.3) * cur_vals.fillna(0) + (1 - w_cur.fillna(0.7)) * prev_vals.fillna(0)
                             df[cur] = blended.where(cur_vals.notna() | prev_vals.notna(), df[cur])
             
-            # Apply minutes-aware shrinkage and positional clamps on xG/90 and xA/90
-            df = self._apply_xg_xa_shrinkage(df)
+            # Note: shrinkage will be applied unconditionally after this try/except
                         
         except Exception as e:
             print(f"Understat integration failed: {e}")
+
+        # Always apply minutes-aware shrinkage and positional clamps on xG/90 and xA/90,
+        # even if Understat integration failed and we fell back to alternative sources.
+        df = self._apply_xg_xa_shrinkage(df)
 
         # Apply alternative data sources for missing xG/xA data  
         missing_data = df["xg_per90"].isna().sum() + df["xa_per90"].isna().sum()
@@ -232,6 +252,16 @@ class MLPipeline:
             
         engineered = self.engineer.create_features(df, fixture_data)
         
+        # Try to enhance fixture multipliers using free odds totals (if keys provided)
+        try:
+            odds_mult = self._fetch_odds_multipliers()
+            if odds_mult:
+                engineered["odds_fixture_mult"] = engineered["team_id"].map(odds_mult)
+                # Where we have odds, prefer them; else keep existing fixture_strength
+                engineered["fixture_strength"] = engineered["odds_fixture_mult"].fillna(engineered.get("fixture_strength", 1.0))
+        except Exception as _:
+            pass
+
         # Add additional computed features
         if "total_points" in engineered.columns and "minutes" in engineered.columns:
             # Points per minute efficiency
@@ -246,12 +276,75 @@ class MLPipeline:
             
         return engineered
 
-    def _team_opp_map(self) -> Tuple[dict, dict]:
-        """Build mapping of team_id -> (opp_id, is_home) for current GW."""
+    def _fetch_odds_multipliers(self) -> dict[int, float]:
+        """Fetch free odds totals and convert to simple multipliers per team.
+        Uses The Odds API or API-Football if available. Returns team_id -> multiplier.
+        """
         try:
-            current_gw = self.fpl.current_gameweek()
+            raw = self.alt_sources.get_free_odds_team_totals()
+            if not isinstance(raw, dict) or raw.get("status") != "ok":
+                return {}
+            # Build FPL team mapping
+            teams = pd.DataFrame(self.fpl.bootstrap_static().get("teams", []))
+            if teams.empty:
+                return {}
+            def norm(s: str) -> str:
+                return str(s or "").lower().replace(" fc", "").replace(".", "").strip()
+            id_to_name = {int(r.id): r.name for _, r in teams.iterrows()}
+            id_to_short = {int(r.id): r.short_name for _, r in teams.iterrows()}
+            name_to_id = {norm(v): k for k, v in id_to_name.items()}
+            short_to_id = {norm(v): k for k, v in id_to_short.items()}
+
+            def team_id_from(name: str) -> int | None:
+                n = norm(name)
+                if n in name_to_id:
+                    return name_to_id[n]
+                if n in short_to_id:
+                    return short_to_id[n]
+                return None
+
+            totals = {}
+            if raw.get("source") == "oddsapi":
+                # raw['raw'] is a list of events
+                for ev in raw.get("raw", []):
+                    home = ev.get("home_team"); away = ev.get("away_team")
+                    markets = ev.get("bookmakers", []) or ev.get("markets", [])
+                    total_line = None
+                    # Different books list: support both top-level markets or nested bookmakers
+                    for m in ev.get("markets", []) or []:
+                        if m.get("key") == "totals" and m.get("outcomes"):
+                            total_line = m["outcomes"][0].get("point")
+                            break
+                    if total_line is None:
+                        for bk in markets:
+                            for m in bk.get("markets", []) or []:
+                                if m.get("key") == "totals" and m.get("outcomes"):
+                                    total_line = m["outcomes"][0].get("point"); break
+                            if total_line is not None: break
+                    if total_line is None:
+                        continue
+                    try:
+                        total_line = float(total_line)
+                    except Exception:
+                        continue
+                    mult = max(0.85, min(1.15, 1.0 + (total_line - 2.5) * 0.07))
+                    hid = team_id_from(home); aid = team_id_from(away)
+                    if hid is not None: totals[hid] = mult
+                    if aid is not None: totals[aid] = mult
+            elif raw.get("source") == "api-football":
+                # Schema varies; fall back to empty until mapped properly
+                pass
+            return totals
+        except Exception:
+            return {}
+
+    def _team_opp_map(self) -> Tuple[dict, dict]:
+        """Build mapping of team_id -> (opp_id, is_home) for next active GW."""
+        try:
+            # Use next active gameweek for fresh fixture data
+            target_gw = self.fpl.next_active_gameweek()
             fixtures = pd.DataFrame(self.fpl.fixtures())
-            cur = fixtures[fixtures.get("event") == current_gw]
+            cur = fixtures[fixtures.get("event") == target_gw]
             opp_map: dict[int, Tuple[int, bool]] = {}
             for _, r in cur.iterrows():
                 th, ta = int(r.get("team_h")), int(r.get("team_a"))
@@ -274,21 +367,32 @@ class MLPipeline:
 
     @staticmethod
     def _clean_sheet_probability(our_def: float | None, opp_att: float | None) -> float:
-        """Heuristic CS probability from relative strengths. Lower opp_att and higher our_def -> higher CS.
+        """Improved CS probability from relative strengths. Lower opp_att and higher our_def -> higher CS.
+        Uses realistic FPL clean sheet rates based on team strength differential.
         Returns 0..1.
         """
         try:
             if our_def is None or opp_att is None:
-                return 0.25
-            # Normalize strengths roughly around league average (~100)
-            our = float(our_def) / 100.0
-            opp = float(opp_att) / 100.0
-            score = (our - opp)  # higher better
-            # Map score to probability via logistic
+                return 0.25  # League average CS rate ~25%
+
+            # Normalize strengths around league average (~100)
+            our_def_norm = float(our_def) / 100.0
+            opp_att_norm = float(opp_att) / 100.0
+
+            # Calculate strength differential (positive = better chance of CS)
+            strength_diff = our_def_norm - opp_att_norm
+
+            # Map to CS probability using a more realistic curve
+            # Based on historical FPL data: top defenses get ~40-50% CS vs weak attacks
+            # Average matchups get ~20-30%, strong attacks vs weak defenses get ~10-15%
             import math
-            prob = 1.0 / (1.0 + math.exp(-3.0 * score))
-            # Clamp to sensible range for FPL CS (~0.1..0.7)
-            return float(max(0.1, min(0.7, prob)))
+
+            # Use gentler logistic curve with coefficient of 1.5 instead of 3.0
+            # This creates more realistic probability distribution
+            prob = 0.25 + 0.25 * math.tanh(1.5 * strength_diff)
+
+            # Clamp to realistic FPL clean sheet range
+            return float(max(0.10, min(0.60, prob)))
         except Exception:
             return 0.25
 
@@ -297,30 +401,249 @@ class MLPipeline:
         # 2 points if >=60; approximate with start probability
         return max(0.0, min(1.0, start_prob)) * 2.0
 
-    @staticmethod
-    def _predict_minutes(row: pd.Series) -> float:
-        """Simple xMins model using chance_next, fpl_status, and recent minutes if available."""
+    def _predict_minutes(self, row: pd.Series) -> float:
+        """Enhanced xMins model with sophisticated rotation risk analysis."""
         try:
-            chance = pd.to_numeric(row.get("chance_next"), errors="coerce")
-            status = str(row.get("fpl_status", "a")).lower()
-            # Base start probability from chance/status
-            if status in ["i", "s", "u"]:
-                start_prob = 0.05
-            elif status == "d":
-                start_prob = 0.5 if pd.isna(chance) else float(chance) / 100.0
+            player_id = row.get("id", 0)
+            team_id = row.get("team_id", 0)
+
+            # Step 1: Base probability from FPL status and chance
+            base_prob = self._get_base_start_probability(row)
+
+            # Step 2: Fixture congestion analysis
+            congestion_factor = self._analyze_fixture_congestion(team_id)
+
+            # Step 3: Historical rotation patterns
+            rotation_risk = self._calculate_rotation_risk(player_id, team_id, row)
+
+            # Step 4: Recent playing time trend
+            minutes_trend = self._analyze_minutes_trend(row)
+
+            # Step 5: Position and role analysis
+            position_factor = self._get_position_rotation_factor(row)
+
+            # Step 6: Manager tendencies
+            manager_factor = self._get_manager_rotation_tendency(team_id)
+
+            # Step 7: Combine all factors
+            final_start_prob = base_prob * congestion_factor * (1 - rotation_risk) * minutes_trend * position_factor * manager_factor
+
+            # Ensure realistic bounds
+            final_start_prob = max(0.05, min(0.95, final_start_prob))
+
+            # Convert to expected minutes
+            expected_minutes = self._convert_probability_to_minutes(final_start_prob, row)
+
+            return float(expected_minutes)
+
+        except Exception as e:
+            self.logger.error(f"Error in enhanced minutes prediction: {e}")
+            return 65.0  # Safe fallback
+
+    def _get_base_start_probability(self, row: pd.Series) -> float:
+        """Get base start probability from FPL status and chance"""
+        chance = pd.to_numeric(row.get("chance_next"), errors="coerce")
+        status = str(row.get("fpl_status", "a")).lower()
+
+        # FPL status mapping
+        if status in ["i", "s", "u"]:  # Injured, suspended, unavailable
+            return 0.05
+        elif status == "d":  # Doubtful
+            return 0.4 if pd.isna(chance) else float(chance) / 100.0 * 0.8
+        else:  # Available
+            return 0.88 if pd.isna(chance) else float(chance) / 100.0
+
+    def _analyze_fixture_congestion(self, team_id: int) -> float:
+        """Analyze fixture congestion for rotation risk"""
+        try:
+            # Get team's fixtures in next 7 days
+            fixtures = self.fpl.fixtures()
+            current_time = pd.Timestamp.now()
+
+            upcoming_fixtures = []
+            for fixture in fixtures:
+                if fixture.get('team_h') == team_id or fixture.get('team_a') == team_id:
+                    kickoff_time = pd.to_datetime(fixture.get('kickoff_time', ''), errors='coerce')
+                    if pd.notna(kickoff_time) and kickoff_time > current_time:
+                        days_until = (kickoff_time - current_time).days
+                        if days_until <= 7:
+                            upcoming_fixtures.append(days_until)
+
+            # Rotation factor based on fixture density
+            if len(upcoming_fixtures) >= 3:  # 3+ games in 7 days
+                return 0.7  # High rotation risk
+            elif len(upcoming_fixtures) == 2:  # 2 games in 7 days
+                return 0.85  # Moderate rotation risk
             else:
-                start_prob = 0.9 if pd.isna(chance) else float(chance) / 100.0
-            # Recent minutes proxy from rolling features if present
-            recent = pd.to_numeric(row.get("minutes_form_3"), errors="coerce")
-            if pd.isna(recent):
-                recent = pd.to_numeric(row.get("minutes"), errors="coerce")
-            # Scale expected minutes: starters ~ 85, others lower
-            exp_mins = 85.0 * start_prob
-            if pd.notna(recent):
-                exp_mins = max(20.0, min(90.0, 0.5 * exp_mins + 0.5 * min(90.0, recent)))
-            return float(exp_mins)
+                return 1.0  # No congestion
+
         except Exception:
-            return 65.0
+            return 1.0  # No adjustment if data unavailable
+
+    def _calculate_rotation_risk(self, player_id: int, team_id: int, row: pd.Series) -> float:
+        """Calculate rotation risk based on historical patterns"""
+        try:
+            # Age factor (older players more likely to be rotated)
+            age = row.get('age', 27)
+            age_factor = 0.1 if age >= 32 else (0.05 if age >= 29 else 0.0)
+
+            # Price factor (cheap players more rotation risk)
+            price = row.get('now_cost', 50) / 10
+            price_factor = 0.15 if price < 5.0 else (0.05 if price < 7.0 else 0.0)
+
+            # Minutes consistency (check recent variance)
+            recent_minutes = [
+                row.get('minutes_form_1', 0),
+                row.get('minutes_form_2', 0),
+                row.get('minutes_form_3', 0)
+            ]
+            recent_minutes = [m for m in recent_minutes if m > 0]
+
+            if len(recent_minutes) >= 2:
+                minutes_variance = np.var(recent_minutes)
+                variance_factor = min(0.2, minutes_variance / 1000)  # High variance = rotation risk
+            else:
+                variance_factor = 0.0
+
+            # Total rotation risk
+            total_risk = age_factor + price_factor + variance_factor
+            return min(0.4, total_risk)  # Cap at 40% risk
+
+        except Exception:
+            return 0.1  # Default modest risk
+
+    def _analyze_minutes_trend(self, row: pd.Series) -> float:
+        """Analyze recent minutes trend"""
+        try:
+            # Get last 3 gameweeks minutes
+            minutes_data = [
+                row.get('minutes_form_1', 0),
+                row.get('minutes_form_2', 0),
+                row.get('minutes_form_3', 0)
+            ]
+
+            # Remove zeros and calculate trend
+            valid_minutes = [m for m in minutes_data if m > 0]
+            if len(valid_minutes) < 2:
+                return 1.0  # No trend data
+
+            # Calculate trend (is player getting more or fewer minutes?)
+            recent_avg = np.mean(valid_minutes[:2]) if len(valid_minutes) >= 2 else valid_minutes[0]
+            older_avg = valid_minutes[-1] if len(valid_minutes) >= 3 else recent_avg
+
+            if recent_avg > older_avg + 10:  # Getting more minutes
+                return 1.1
+            elif recent_avg < older_avg - 15:  # Getting fewer minutes
+                return 0.85
+            else:
+                return 1.0  # Stable
+
+        except Exception:
+            return 1.0
+
+    def _get_position_rotation_factor(self, row: pd.Series) -> float:
+        """Get position-specific rotation factors"""
+        position_id = row.get('element_type', 3)
+
+        # Position rotation tendencies
+        position_factors = {
+            1: 1.0,   # GKP - usually fixed
+            2: 0.92,  # DEF - some rotation
+            3: 0.88,  # MID - more rotation
+            4: 0.90   # FWD - moderate rotation
+        }
+
+        return position_factors.get(position_id, 0.9)
+
+    def _get_manager_rotation_tendency(self, team_id: int) -> float:
+        """Get manager-specific rotation tendencies"""
+        # Manager rotation tendencies (based on general knowledge)
+        # In real implementation, this would be learned from historical data
+        rotation_managers = {
+            # Teams known for heavy rotation (lower factor)
+            1: 0.85,  # Arsenal (Arteta rotates)
+            3: 0.80,  # Brighton (De Zerbi tactical rotation)
+            6: 0.88,  # Chelsea (rotation based on form)
+            7: 0.75,  # Crystal Palace (Vieira rotation)
+            11: 0.85, # Liverpool (Klopp rotation)
+            13: 0.80, # Man City (Pep heavy rotation)
+            17: 0.85, # Tottenham (Conte/Postecoglou rotation)
+        }
+
+        return rotation_managers.get(team_id, 0.95)  # Most teams have modest rotation
+
+    def _convert_probability_to_minutes(self, start_prob: float, row: pd.Series) -> float:
+        """Convert start probability to expected minutes"""
+        # Base minutes for different probability ranges
+        if start_prob >= 0.8:  # Likely starter
+            base_minutes = 82
+        elif start_prob >= 0.6:  # Probable starter
+            base_minutes = 75
+        elif start_prob >= 0.4:  # Possible starter
+            base_minutes = 60
+        elif start_prob >= 0.2:  # Bench option
+            base_minutes = 25
+        else:  # Unlikely to play
+            base_minutes = 10
+
+        # Adjust based on recent playing patterns
+        recent = pd.to_numeric(row.get("minutes_form_3"), errors="coerce")
+        if pd.notna(recent) and recent > 0:
+            # Blend with recent average (60% model, 40% recent)
+            final_minutes = 0.6 * base_minutes + 0.4 * recent
+        else:
+            final_minutes = base_minutes
+
+        # Apply start probability scaling
+        expected_minutes = final_minutes * start_prob
+
+        # Ensure realistic bounds
+        return max(5.0, min(90.0, expected_minutes))
+
+    def _apply_twitter_signals(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Adjust availability/start probability and augment roles using Twitter signals if available."""
+        if not self.twitter:
+            return df
+        try:
+            tweets = self.twitter.fetch_news()
+            enhanced = self.twitter.extract_enhanced_signals(tweets)
+            avail = enhanced.get('availability', {})
+            set_pieces = enhanced.get('set_pieces', {})
+            pos_hints = enhanced.get('position', {})
+            recommend = enhanced.get('recommend', {})
+            if not (avail or set_pieces or pos_hints or recommend):
+                return df
+            out = df.copy()
+            # Map by player last name if possible
+            out['name_lower'] = out.get('name', '').astype(str).str.lower()
+            out['last_name'] = out['name_lower'].str.split().str[-1]
+            # Adjust chance_next by small increments based on signals
+            if 'chance_next' not in out.columns:
+                out['chance_next'] = 90.0
+            base = pd.to_numeric(out['chance_next'], errors='coerce').fillna(90.0)
+            delta = out['last_name'].map(avail).fillna(0.0) * 100.0  # convert 0.1 -> 10%
+            out['chance_next'] = (base + delta).clip(lower=0.0, upper=100.0)
+
+            # Set-piece role nudges: small boosts to xa/xg priors
+            if 'xa_per90' in out.columns:
+                xa = pd.to_numeric(out['xa_per90'], errors='coerce')
+                corners_boost = out['last_name'].map({k: 0.03 for k, v in set_pieces.items() if v.get('corners')}).fillna(0.0)
+                fk_boost = out['last_name'].map({k: 0.02 for k, v in set_pieces.items() if v.get('fks')}).fillna(0.0)
+                out['xa_per90'] = (xa.fillna(0.0) + corners_boost + fk_boost).clip(upper=0.6)
+            if 'xg_per90' in out.columns:
+                xg = pd.to_numeric(out['xg_per90'], errors='coerce')
+                pens_boost = out['last_name'].map({k: 0.04 for k, v in set_pieces.items() if v.get('pens')}).fillna(0.0)
+                out['xg_per90'] = (xg.fillna(0.0) + pens_boost).clip(upper=0.9)
+
+            # Position hints: can nudge position for priors (only if plausible)
+            mask = out['last_name'].isin(list(pos_hints.keys()))
+            out.loc[mask, 'position_hint'] = out.loc[mask, 'last_name'].map(pos_hints)
+
+            # Recommendations: small EP nudge via a temporary feature used in blending
+            out['news_recommendation_boost'] = out['last_name'].map(recommend).fillna(0.0)
+            return out.drop(columns=['name_lower', 'last_name'])
+        except Exception:
+            return df
 
     @staticmethod
     def _goal_points(position: str) -> int:
@@ -412,11 +735,14 @@ class MLPipeline:
                 form_multiplier = max(0.5, min(1.5, 1.0 + (last_season_form - 3.0) / 10.0))
                 
                 if position == "FWD":
-                    xg90 = max(0.2, min(0.7, (price - 6.0) * 0.12)) * form_multiplier
+                    # Increased scaling for forwards - they score more than modeled
+                    xg90 = max(0.3, min(1.0, (price - 6.0) * 0.18)) * form_multiplier  # Increased from 0.2-0.7 to 0.3-1.0
                 elif position == "MID":
-                    xg90 = max(0.05, min(0.3, (price - 5.0) * 0.06)) * form_multiplier  
+                    # Premium midfielders get significant xG
+                    xg90 = max(0.08, min(0.5, (price - 5.0) * 0.09)) * form_multiplier  # Increased from 0.05-0.3 to 0.08-0.5
                 elif position == "DEF":
-                    xg90 = max(0.01, min(0.08, (price - 4.0) * 0.015)) * form_multiplier
+                    # Attacking defenders can score
+                    xg90 = max(0.02, min(0.12, (price - 4.0) * 0.025)) * form_multiplier  # Increased from 0.01-0.08 to 0.02-0.12
                 else:  # GKP
                     xg90 = 0.005
             else:
@@ -431,20 +757,49 @@ class MLPipeline:
                 form_multiplier = max(0.5, min(1.5, 1.0 + (last_season_form - 3.0) / 10.0))
                 
                 if position == "MID":
-                    xa90 = max(0.10, min(0.4, (price - 5.0) * 0.08)) * form_multiplier
+                    # Premium midfielders create many assists
+                    xa90 = max(0.15, min(0.6, (price - 5.0) * 0.12)) * form_multiplier  # Increased from 0.10-0.4 to 0.15-0.6
                 elif position == "FWD":
-                    xa90 = max(0.05, min(0.2, (price - 6.0) * 0.05)) * form_multiplier
+                    # Modern forwards get assists too
+                    xa90 = max(0.08, min(0.3, (price - 6.0) * 0.08)) * form_multiplier  # Increased from 0.05-0.2 to 0.08-0.3
                 elif position == "DEF":
-                    xa90 = max(0.02, min(0.1, (price - 4.0) * 0.02)) * form_multiplier
+                    # Wing-backs and attacking defenders
+                    xa90 = max(0.03, min(0.15, (price - 4.0) * 0.03)) * form_multiplier  # Increased from 0.02-0.1 to 0.03-0.15
                 else:  # GKP
                     xa90 = 0.01
             else:
                 xa90 = float(recent_xa or av or 0.0)
             
-            # Apply fixture difficulty adjustment
+            # Apply fixture difficulty adjustment (generic)
             fixture_mult = float(r.get("fixture_strength", 1.0))
             xg90 *= fixture_mult
             xa90 *= fixture_mult
+
+            # Opponent-aware scaling: temper attack by opponent defence for the specific matchup
+            # Uses FPL team strengths: lower opp attack/defence values mean stronger team.
+            try:
+                team_id_local = int(r.get("team_id")) if pd.notna(r.get("team_id")) else None
+            except Exception:
+                team_id_local = None
+            if team_id_local in opp_map and team_id_local in strength:
+                opp_id, is_home = opp_map[team_id_local]
+                our = strength.get(team_id_local, {})
+                opp = strength.get(opp_id, {})
+                # Defensive strength scale ~100; lower is stronger defence
+                opp_def = opp.get("def_a" if is_home else "def_h")
+                our_att = our.get("att_h" if is_home else "att_a")
+                try:
+                    opp_def = float(opp_def) if opp_def is not None else 100.0
+                    our_att = float(our_att) if our_att is not None else 100.0
+                    # Normalize around 100. Strong opp defence (<100) reduces our attack; weak defence (>100) boosts it.
+                    # Keep the effect modest to avoid whiplash.
+                    attack_scale = (our_att / 100.0) * (100.0 / max(1.0, opp_def))
+                    # Clamp to a reasonable band (slightly wider to have visible effect)
+                    attack_scale = max(0.80, min(1.20, attack_scale))
+                    xg90 *= attack_scale
+                    xa90 *= attack_scale
+                except Exception:
+                    pass
             
             exp_goals = xg90 * (expected_minutes / 90.0)
             exp_assists = xa90 * (expected_minutes / 90.0)
@@ -463,26 +818,32 @@ class MLPipeline:
                 opp = strength.get(opp_id, {})
                 our_def = our.get("def_h" if is_home else "def_a")
                 opp_att = opp.get("att_a" if is_home else "att_h")
-                cs_prob = self._clean_sheet_probability(our_def, opp_att)
-                
-                # Home advantage for clean sheets
-                if is_home:
-                    cs_prob *= 1.1
+                base_cs = self._clean_sheet_probability(our_def, opp_att)
+                # Apply modest home advantage consistent with new CS ranges
+                cs_prob = base_cs * (1.08 if is_home else 1.0)
+                # Clamp to realistic range (already handled in _clean_sheet_probability, but ensure consistency)
+                cs_prob = float(max(0.10, min(0.60, cs_prob)))
             
             cs_pts = cs_prob * self._clean_sheet_points(pos)
             
             # Enhanced appearance points with form consideration
             appear = self._appearance_points(start_prob)
             
-            # More sophisticated bonus calculation
+            # Enhanced bonus calculation - FPL bonus system is significant
             attacking_threat = exp_goals + exp_assists
-            bonus_base = min(2.0, 0.8 * attacking_threat)
-            
+
+            # Bonus points are more frequent than modeled - increase base calculation
+            bonus_base = min(3.0, 1.2 * attacking_threat)  # Increased from 0.8 to 1.2, max from 2.0 to 3.0
+
+            # Price-based bonus adjustment - expensive players get bonus more often
+            price = float(r.get("price", 5.0))
+            price_bonus_mult = 1.0 + max(0.0, (price - 8.0) * 0.1)  # Premium players get 10% more bonus per £1m above 8.0
+
             # Add consistency bonus (ensure we have a valid value)
             consistency = pd.to_numeric(r.get("consistency"), errors="coerce")
             if pd.isna(consistency):
                 consistency = 1.0
-            bonus = bonus_base * float(consistency)
+            bonus = bonus_base * float(consistency) * price_bonus_mult
             
             # Add momentum adjustment  
             momentum = pd.to_numeric(r.get("momentum"), errors="coerce")
@@ -520,9 +881,24 @@ class MLPipeline:
 
     def predict_current(self) -> pd.DataFrame:
         """Enhanced prediction with better model blending and validation"""
+        # Validate fixture data freshness before predictions
+        validation = self.fpl.validate_fixture_freshness()
+        if validation["status"] == "error":
+            print(f"WARNING: Fixture data validation failed: {validation.get('error', 'Unknown error')}")
+            for issue in validation.get("issues", []):
+                print(f"  - {issue}")
+        elif validation["status"] == "warning":
+            print(f"WARNING: Fixture data quality issues detected:")
+            for issue in validation.get("issues", []):
+                print(f"  - {issue}")
+
+        print(f"Using gameweek {validation.get('next_active_gw', 'unknown')} for fixture data ({validation.get('upcoming_fixtures_count', 0)} upcoming fixtures)")
+
         df = self.prepare_training_data()
         if df.empty:
             return df
+        # Apply Twitter news availability adjustments if possible
+        df = self._apply_twitter_signals(df)
         
         # Enhanced ML prediction with error handling
         ml_pred: pd.Series | None = None
@@ -546,22 +922,85 @@ class MLPipeline:
         ep_component = self._component_expected_points(df)
         ep_component = pd.to_numeric(ep_component, errors="coerce").fillna(0.0)
 
-        # Intelligent blending based on data quality and model confidence
+        # Intelligent blending based on data quality, model confidence, and matchup risk
         if ml_pred is not None and len(ml_pred) == len(df):
             ml_pred_clean = pd.to_numeric(ml_pred, errors="coerce").fillna(0.0)
+
+            # Compute per-row risk adjustment to downweight ML in risky contexts (rotation, tough matchup)
+            opp_map, strength = self._team_opp_map()
+            risk = np.ones(len(df), dtype=float)
+            for i, r in df.reset_index(drop=True).iterrows():
+                try:
+                    pos = str(r.get("position", ""))
+                    team_id = int(r.get("team_id")) if pd.notna(r.get("team_id")) else None
+                    if team_id in opp_map and team_id in strength:
+                        opp_id, is_home = opp_map[team_id]
+                        our = strength.get(team_id, {})
+                        opp = strength.get(opp_id, {})
+                        # Opponent attack/defense indices
+                        opp_att = float(opp.get("att_a" if is_home else "att_h", 100))
+                        opp_def = float(opp.get("def_h" if is_home else "def_a", 100))
+                        # Downweight defenders vs strong attacking opponents
+                        if pos in ("DEF", "GKP"):
+                            if opp_att > 110:
+                                risk[i] *= 0.6
+                            elif opp_att > 105:
+                                risk[i] *= 0.75
+                        # Downweight attackers vs strong defenses
+                        elif pos in ("FWD", "MID"):
+                            if opp_def < 95:
+                                risk[i] *= 0.8
+                    # Rotation risk: very low recent minutes
+                    recent = pd.to_numeric(r.get("minutes_form_3"), errors="coerce")
+                    if pd.notna(recent) and recent < 45:
+                        risk[i] *= 0.85
+                except Exception:
+                    continue
+
+            # Bound risk and derive per-row alpha
+            risk = np.clip(risk, 0.5, 1.0)
+            # Recommendation boosts can slightly increase reliance on component EP (more transparent)
+            if 'news_recommendation_boost' in df.columns:
+                rec_boost_vals = pd.to_numeric(df['news_recommendation_boost'], errors='coerce').fillna(0.0).values
+            else:
+                rec_boost_vals = np.zeros(len(df), dtype=float)
+            # Premium players are more predictable - give more weight to ML predictions
+            player_prices = pd.to_numeric(df.get('price', df.get('now_cost', 5)), errors='coerce').fillna(5)
+            premium_boost = np.where(player_prices >= 10.0, 0.1, 0.0)  # +10% ML weight for premium players
             
-            # Adaptive blending - use more ML when we have good data
-            alpha = ml_confidence  # Use ML confidence as blending weight
-            blended = (alpha * ml_pred_clean.values) + ((1 - alpha) * ep_component.values)
-            
-            # Apply sanity checks
+            alpha_vec = np.clip((ml_confidence * risk) - (0.1 * rec_boost_vals) + premium_boost, 0.25, 0.85)
+
+            blended = (alpha_vec * ml_pred_clean.values) + ((1 - alpha_vec) * ep_component.values)
+
+            # Apply sanity checks (but allow premium players to exceed 20 points)
             blended = np.where(blended < 0, ep_component.values, blended)
-            blended = np.where(blended > 20, np.minimum(20, ep_component.values * 1.5), blended)
+            
+            # Position-based scoring caps - FPL players can score much more than 20 points
+            player_prices = pd.to_numeric(df.get('price', df.get('now_cost', 5)), errors='coerce').fillna(5)
+            positions = df.get('position', 'MID').fillna('MID')
+
+            # Realistic FPL scoring caps by position and price
+            base_caps = np.where(positions == 'GKP', 15,
+                        np.where(positions == 'DEF', 20,
+                        np.where(positions == 'MID', 25,
+                        np.where(positions == 'FWD', 30, 20))))  # Higher caps for attackers
+
+            # Premium player multiplier
+            premium_multiplier = np.where(player_prices >= 10.0, 1.3,
+                                np.where(player_prices >= 8.0, 1.2, 1.0))
+
+            max_allowed = base_caps * premium_multiplier
+
+            # Apply realistic caps - good players can have big games
+            blended = np.where(blended > max_allowed, np.minimum(max_allowed, ep_component.values * 1.5), blended)
         else:
             blended = ep_component.values
             
         # Clean NaN/inf values (np already imported at top)
-        blended = np.nan_to_num(blended, nan=0.0, posinf=15.0, neginf=0.0)
+        blended = np.nan_to_num(blended, nan=0.0, posinf=30.0, neginf=0.0)
+
+        # Add prediction validation logging for debugging
+        self._validate_predictions(blended, df)
 
         # Enhanced result compilation with team names and fixture info
         base_cols = ["player_id", "name", "position", "team_id", "price", "team_short", 
@@ -584,9 +1023,8 @@ class MLPipeline:
         try:
             fixtures_df = pd.DataFrame(self.fpl.fixtures())
             events = self.fpl.bootstrap_static().get("events", [])
-            current_gw = next((e["id"] for e in events if e.get("is_current", False)), None)
-            next_gw = next((e["id"] for e in events if e.get("is_next", False)), None)
-            start_gw = next_gw or current_gw or 1
+            # Use next active gameweek for fresh fixture display
+            start_gw = self.fpl.next_active_gameweek()
             end_gw = start_gw + 4  # next 5 gameweeks inclusive of start
 
             # Precompute mapping team_id -> ordered list of next fixtures with difficulty
@@ -705,4 +1143,139 @@ class MLPipeline:
         
         preds.to_csv("data/processed/predictions_current.csv", index=False)
         return preds
+
+    def predict_gameweek(self, use_enhanced_model: bool = True) -> pd.DataFrame:
+        """
+        Generate gameweek predictions using enhanced model or fallback to basic model
+        """
+        try:
+            if use_enhanced_model:
+                # Get current gameweek
+                bs = self.fpl.bootstrap_static()
+                if not bs:
+                    raise Exception("Could not fetch bootstrap data")
+
+                events = bs.get("events", [])
+                current_gw = next((e["id"] for e in events if e.get("is_current", False)), 1)
+
+                # Use enhanced prediction model
+                predictions_df = self.enhanced_model.generate_enhanced_predictions(current_gw)
+
+                if not predictions_df.empty:
+                    # Convert enhanced predictions to expected format
+                    predictions_df = self._format_enhanced_predictions(predictions_df)
+                    print(f"Enhanced model generated predictions for {len(predictions_df)} players")
+                    return predictions_df
+
+            # Fallback to basic model if enhanced model fails or is disabled
+            print("Falling back to basic prediction model")
+            return self.predict_players()
+
+        except Exception as e:
+            print(f"Prediction failed: {e}")
+            # Return empty DataFrame as ultimate fallback
+            return pd.DataFrame()
+
+    def _validate_predictions(self, predictions: np.ndarray, df: pd.DataFrame) -> None:
+        """Validate predictions and log anomalies for debugging"""
+        try:
+            positions = df.get('position', 'MID').fillna('MID')
+            prices = pd.to_numeric(df.get('price', 5), errors='coerce').fillna(5)
+            names = df.get('name', 'Unknown').fillna('Unknown')
+
+            # Position-based validation ranges
+            for i, (pred, pos, price, name) in enumerate(zip(predictions, positions, prices, names)):
+                # Define realistic ranges
+                if pos == 'GKP' and (pred < 1 or pred > 20):
+                    print(f"Warning: GKP {name} prediction {pred:.1f} outside range (1-20)")
+                elif pos == 'DEF' and (pred < 1 or pred > 25):
+                    print(f"Warning: DEF {name} prediction {pred:.1f} outside range (1-25)")
+                elif pos == 'MID' and (pred < 2 or pred > 30):
+                    print(f"Warning: MID {name} prediction {pred:.1f} outside range (2-30)")
+                elif pos == 'FWD' and (pred < 2 or pred > 35):
+                    print(f"Warning: FWD {name} prediction {pred:.1f} outside range (2-35)")
+
+                # Price vs prediction sanity check
+                if price >= 12.0 and pred < 6.0:
+                    print(f"Warning: Premium player {name} (£{price}m) has low prediction {pred:.1f}")
+                elif price <= 5.0 and pred > 15.0:
+                    print(f"Warning: Budget player {name} (£{price}m) has high prediction {pred:.1f}")
+
+            # Team summary stats
+            avg_pred = np.mean(predictions)
+            print(f"Prediction validation: {len(predictions)} players, avg={avg_pred:.2f}, min={np.min(predictions):.2f}, max={np.max(predictions):.2f}")
+
+        except Exception as e:
+            print(f"Validation failed: {e}")
+
+    def predict_players(self) -> pd.DataFrame:
+        """Basic player prediction fallback method"""
+        try:
+            # Use the existing predict_current method as fallback
+            return self.predict_current()
+        except Exception as e:
+            print(f"Basic prediction fallback failed: {e}")
+            # Return minimal empty dataframe with required columns
+            return pd.DataFrame(columns=['id', 'name', 'position', 'team', 'predicted_points', 'prediction_confidence'])
+
+    def _format_enhanced_predictions(self, enhanced_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Format enhanced predictions to match expected interface
+        """
+        try:
+            # Map enhanced prediction columns to expected format
+            formatted_df = enhanced_df.copy()
+
+            # Rename columns to match expected interface
+            column_mapping = {
+                'id': 'player_id',  # TeamSelector expects player_id
+                'enhanced_prediction': 'predicted_points',
+                'prediction_confidence': 'confidence',
+                'availability_score': 'availability',
+                'venue_adjusted_difficulty': 'fixture_difficulty',
+                'points_per_million': 'value_rating'
+            }
+
+            for old_col, new_col in column_mapping.items():
+                if old_col in formatted_df.columns:
+                    formatted_df[new_col] = formatted_df[old_col]
+
+            # Ensure required columns exist
+            required_columns = ['player_id', 'name', 'position', 'team', 'price', 'predicted_points']
+            for col in required_columns:
+                if col not in formatted_df.columns:
+                    if col == 'predicted_points':
+                        formatted_df[col] = formatted_df.get('enhanced_prediction', 2.0)
+                    else:
+                        formatted_df[col] = 'Unknown'
+
+            # Add additional useful columns
+            if 'points_per_million' not in formatted_df.columns:
+                formatted_df['points_per_million'] = (formatted_df['predicted_points'] / formatted_df['price']).round(2)
+
+            # Add form and team context
+            if 'form' in formatted_df.columns:
+                formatted_df['recent_form'] = formatted_df['form']
+
+            # Add captaincy potential (simple heuristic)
+            formatted_df['captaincy_potential'] = (
+                formatted_df['predicted_points'] *
+                formatted_df.get('confidence', 0.5) *
+                (1 + formatted_df.get('momentum_score', 1.0) * 0.2)
+            ).round(2)
+
+            # Sort by predicted points
+            formatted_df = formatted_df.sort_values('predicted_points', ascending=False)
+
+            print(f"Enhanced model prediction summary:")
+            print(f"- Total players: {len(formatted_df)}")
+            print(f"- Top prediction: {formatted_df['predicted_points'].max():.1f} pts")
+            print(f"- Average prediction: {formatted_df['predicted_points'].mean():.1f} pts")
+            print(f"- Positions covered: {formatted_df['position'].nunique()}")
+
+            return formatted_df
+
+        except Exception as e:
+            print(f"Error formatting enhanced predictions: {e}")
+            return enhanced_df  # Return original if formatting fails
 

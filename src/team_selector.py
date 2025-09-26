@@ -117,23 +117,48 @@ class TeamSelector:
         budget = self.budget
         
         # Smart budget allocation for this formation
+        # Allow more flexibility for premium players by increasing budgets
         position_budgets = {
-            'GKP': min(12.0, budget * 0.12),
-            'DEF': min(35.0, budget * 0.30),
-            'MID': min(45.0, budget * 0.45),
-            'FWD': min(25.0, budget * 0.25)
+            'GKP': min(15.0, budget * 0.15),    # Increased for premium GKs
+            'DEF': min(40.0, budget * 0.35),    # Increased for premium DEFs
+            'MID': min(50.0, budget * 0.45),    # Keep high for premium MIDs  
+            'FWD': min(40.0, budget * 0.35)     # Increased significantly for premium FWDs
         }
         
-        # Select squad (always 2-5-5-3)
+        # Select squad (always 2-5-5-3) with premium player priority
         for position, count in self.squad_requirements.items():
             pos_budget = position_budgets[position]
             pos_df = df[df['position'] == position].copy()
-            pos_df = pos_df.sort_values('adjusted_points', ascending=False)
+            
+            # Two-pass selection: premium players first, then value players
+            premium_df = pos_df[pos_df['price'] >= 10.0].sort_values('adjusted_points', ascending=False)
+            value_df = pos_df[pos_df['price'] < 10.0].sort_values('adjusted_points', ascending=False)
             
             selected_count = 0
             position_spent = 0
             
-            for _, player in pos_df.iterrows():
+            # Pass 1: Try to select premium players first (if affordable)
+            for _, player in premium_df.iterrows():
+                if selected_count >= count:
+                    break
+                    
+                # Allow premium players to exceed position budget if we have overall budget
+                if player['price'] > budget:
+                    continue
+                
+                team_count = sum(1 for p in selected if p['team_id'] == player['team_id'])
+                if team_count >= 3:
+                    continue
+                
+                # For premium players, be more flexible with position budget
+                if position_spent + player['price'] <= pos_budget * 1.5 or selected_count == 0:
+                    selected.append(player.to_dict())
+                    budget -= player['price']
+                    position_spent += player['price']
+                    selected_count += 1
+            
+            # Pass 2: Fill remaining slots with value players
+            for _, player in value_df.iterrows():
                 if selected_count >= count:
                     break
                 
@@ -332,7 +357,7 @@ class TeamSelector:
     
     def _assign_starters_and_bench(self, selected_players: List[Dict], 
                                  position_requirements: Dict[str, int]) -> Tuple[List[Dict], List[Dict]]:
-        """Assign players to starting XI and bench based on formation"""
+        """Assign players to starting XI and bench based on formation and price logic"""
         
         starters = []
         bench = []
@@ -345,16 +370,28 @@ class TeamSelector:
                 by_position[pos] = []
             by_position[pos].append(player)
         
-        # Sort each position by adjusted points
+        # Sort each position by a combination of price and adjusted points
+        # Premium players (high price) should almost always start
         for pos in by_position:
-            by_position[pos].sort(key=lambda p: p['adjusted_points'], reverse=True)
+            by_position[pos].sort(key=lambda p: (
+                p['adjusted_points'] + p['price'] * 0.5,  # Boost expensive players
+                p['adjusted_points'],  # Then by pure points
+                -p['price']  # Tiebreaker: more expensive first
+            ), reverse=True)
         
-        # Assign starters first (best players in each position)
+        # Assign starters first (prioritizing expensive + high-scoring players)
         for position, required_count in position_requirements.items():
             if position in by_position:
                 pos_players = by_position[position]
-                starters.extend(pos_players[:required_count])
-                bench.extend(pos_players[required_count:])
+                
+                # Special rule: Players over £10m should virtually always start if selected
+                premium_players = [p for p in pos_players if p['price'] >= 10.0]
+                regular_players = [p for p in pos_players if p['price'] < 10.0]
+                
+                # Prioritize premium players for starting spots
+                available_starters = premium_players + regular_players
+                starters.extend(available_starters[:required_count])
+                bench.extend(available_starters[required_count:])
         
         return starters, bench
     
@@ -429,55 +466,71 @@ class TeamSelector:
         for position, count in self.squad_requirements.items():
             pos_budget = position_budgets[position]
             pos_df = df[df['position'] == position].copy()
-            pos_df = pos_df.sort_values('adjusted_points', ascending=False)  # Sort by points, not value
-            
+
+            # Use predicted_points if available, otherwise points_per_game
+            sort_column = 'predicted_points' if 'predicted_points' in pos_df.columns else 'points_per_game'
+            pos_df = pos_df.sort_values(sort_column, ascending=False)
+
             selected_count = 0
             position_spent = 0
-            
+
+            print(f"Selecting {count} {position} players from {len(pos_df)} available")
+
             # Try to get the best players within position budget
             for _, player in pos_df.iterrows():
                 if selected_count >= count:
                     break
-                
+
                 # Check if we can afford this player within position budget
                 if position_spent + player['price'] > pos_budget and selected_count < count - 1:
                     continue  # Save budget for remaining slots
-                    
-                # Check overall budget constraint  
+
+                # Check overall budget constraint
                 if player['price'] > budget:
                     continue
-                
-                # Check team constraint (max 3 per team)
-                team_count = sum(1 for p in selected if p['team_id'] == player['team_id'])
+
+                # Check team constraint (max 3 per team) - use 'team' column
+                team_id = player.get('team', player.get('team_id', 0))
+                team_count = sum(1 for p in selected if p.get('team', p.get('team_id', 0)) == team_id)
                 if team_count >= 3:
                     continue
-                
-                selected.append(player.to_dict())
+
+                # Convert pandas Series to dict properly
+                player_dict = player.to_dict() if hasattr(player, 'to_dict') else dict(player)
+                selected.append(player_dict)
                 budget -= player['price']
                 position_spent += player['price']
                 selected_count += 1
             
             # If we couldn't fill the position, get cheapest available players
             if selected_count < count:
+                print(f"Only selected {selected_count}/{count} {position}, trying cheaper options...")
                 pos_df_cheap = pos_df.sort_values('price')
                 for _, player in pos_df_cheap.iterrows():
                     if selected_count >= count:
                         break
-                    
+
                     if player['price'] > budget:
                         continue
-                        
+
                     # Skip already selected players
                     if any(p['player_id'] == player['player_id'] for p in selected):
                         continue
-                    
-                    team_count = sum(1 for p in selected if p['team_id'] == player['team_id'])
+
+                    # Check team constraint - use 'team' column
+                    team_id = player.get('team', player.get('team_id', 0))
+                    team_count = sum(1 for p in selected if p.get('team', p.get('team_id', 0)) == team_id)
                     if team_count >= 3:
                         continue
-                    
-                    selected.append(player.to_dict())
+
+                    # Convert pandas Series to dict properly
+                    player_dict = player.to_dict() if hasattr(player, 'to_dict') else dict(player)
+                    selected.append(player_dict)
                     budget -= player['price']
+                    position_spent += player['price']
                     selected_count += 1
+
+            print(f"Final {position} selection: {selected_count}/{count} players")
                     
         print(f"Team selection: {len(selected)} players, £{sum(p['price'] for p in selected):.1f}m spent, £{budget:.1f}m remaining")
         

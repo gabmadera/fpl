@@ -69,13 +69,25 @@ class SecurityManager:
         return True
 
     def rate_limit_check(self) -> bool:
-        max_requests = int(os.getenv("MAX_API_REQUESTS_PER_HOUR", 100))
-        if datetime.now() - self.last_request_reset > timedelta(hours=1):
+        max_requests = int(os.getenv("MAX_API_REQUESTS_PER_HOUR", 150))  # Slightly higher default
+        current_time = datetime.now()
+        
+        # Reset counter every hour
+        if current_time - self.last_request_reset > timedelta(hours=1):
             self.request_count = 0
-            self.last_request_reset = datetime.now()
+            self.last_request_reset = current_time
+            
         if self.request_count >= max_requests:
-            self.logger.warning("Rate limit reached, delaying request")
+            # Calculate time until next reset
+            time_until_reset = timedelta(hours=1) - (current_time - self.last_request_reset)
+            minutes_left = int(time_until_reset.total_seconds() / 60)
+            
+            self.logger.warning(
+                f"Rate limit reached ({self.request_count}/{max_requests}). "
+                f"Rate limit resets in {minutes_left} minutes"
+            )
             return False
+            
         self.request_count += 1
         return True
 

@@ -38,6 +38,13 @@ class PositionSpecificFeatureEngineer:
         
         # Form calculation weights (recent games weighted more heavily)
         self.form_weights = np.array([0.4, 0.3, 0.2, 0.1])  # Last 4 games
+
+    @staticmethod
+    def _series_or_default(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
+        """Return a numeric Series for df[col] if present, else a constant series of default."""
+        if col in df.columns:
+            return pd.to_numeric(df[col], errors='coerce').fillna(default)
+        return pd.Series(default, index=df.index)
         
     def engineer_position_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """Create position-specific enhanced features"""
@@ -119,6 +126,13 @@ class PositionSpecificFeatureEngineer:
         df = def_df.copy()
         
         try:
+            # Ensure numeric types
+            for col in ['clean_sheets', 'goals_scored', 'assists', 'tackles', 'interceptions', 'clearances', 'blocks', 'key_passes', 'aerial_duels_won', 'aerial_duels', 'shots', 'games_played', 'bonus']:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+            if 'minutes' in df.columns:
+                df['minutes'] = pd.to_numeric(df['minutes'], errors='coerce').fillna(0)
+            
             # Defensive solidity features
             df['clean_sheet_rate'] = df.get('clean_sheets', 0) / np.maximum(df.get('games_played', 1), 1)
             df['defensive_actions'] = (
@@ -128,12 +142,16 @@ class PositionSpecificFeatureEngineer:
             df['def_actions_per_game'] = df['defensive_actions'] / np.maximum(df.get('games_played', 1), 1)
             
             # Attacking threat for defenders
-            df['attacking_returns'] = df.get('goals_scored', 0) + df.get('assists', 0)
+            goals_series = self._series_or_default(df, 'goals_scored', 0)
+            assists_series = self._series_or_default(df, 'assists', 0)
+            df['attacking_returns'] = goals_series + assists_series
             df['att_returns_rate'] = df['attacking_returns'] / np.maximum(df.get('games_played', 1), 1)
-            df['shots_per_game'] = df.get('shots', 0) / np.maximum(df.get('games_played', 1), 1)
+            df['shots_per_game'] = self._series_or_default(df, 'shots', 0) / np.maximum(df.get('games_played', 1), 1)
             
             # Aerial ability
-            df['aerial_win_rate'] = df.get('aerial_duels_won', 0) / np.maximum(df.get('aerial_duels', 1), 1)
+            aerial_won = self._series_or_default(df, 'aerial_duels_won', 0)
+            aerial_total = self._series_or_default(df, 'aerial_duels', 1)
+            df['aerial_win_rate'] = aerial_won / np.maximum(aerial_total, 1)
             
             # Set piece threat (proxy using headed goals + free kick attempts)
             df['set_piece_threat'] = (
@@ -159,6 +177,9 @@ class PositionSpecificFeatureEngineer:
         df = mid_df.copy()
         
         try:
+            for col in ['key_passes', 'assists', 'chances_created', 'shots_on_target', 'shots_in_box', 'big_chances', 'goals_scored', 'tackles', 'interceptions', 'passes_completed', 'passes_attempted', 'progressive_passes', 'touches_att_pen_area', 'passes_final_third', 'games_played', 'minutes']:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
             # Creativity and playmaking
             df['creativity_index'] = (
                 df.get('key_passes', 0) * 0.4 + 
@@ -204,6 +225,9 @@ class PositionSpecificFeatureEngineer:
         df = fwd_df.copy()
         
         try:
+            for col in ['goals_scored', 'shots', 'shots_on_target', 'big_chances', 'touches_in_box', 'games_played', 'penalties_won', 'penalties_taken', 'team_penalties', 'assists', 'key_passes']:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
             # Clinical finishing
             df['shot_conversion_rate'] = df.get('goals_scored', 0) / np.maximum(df.get('shots', 1), 1)
             df['big_chance_conversion'] = df.get('goals_scored', 0) / np.maximum(df.get('big_chances', 1), 1)
@@ -230,7 +254,9 @@ class PositionSpecificFeatureEngineer:
             
             # Expected goals efficiency
             if 'expected_goals' in df.columns:
-                df['xg_overperformance'] = (df.get('goals_scored', 0) - df.get('expected_goals', 0)) / np.maximum(df.get('games_played', 1), 1)
+                exp_g = self._series_or_default(df, 'expected_goals', 0)
+                goals_series = self._series_or_default(df, 'goals_scored', 0)
+                df['xg_overperformance'] = (goals_series - exp_g) / np.maximum(df.get('games_played', 1), 1)
             
         except Exception as e:
             self.logger.error(f"Forward feature engineering failed: {e}")
@@ -264,17 +290,29 @@ class PositionSpecificFeatureEngineer:
         """Classify players into sub-roles within their position"""
         try:
             df['player_role'] = df['position']  # Default to main position
+            # Ensure required columns exist
+            if 'att_returns_rate' not in df.columns:
+                df['att_returns_rate'] = 0.0
+            # Safe defaults for midfield/forward role features
+            for col in ['creativity_per_game', 'goal_threat_per_game', 'box_to_box_rating', 'assist_rate', 'box_touches_per_game']:
+                if col not in df.columns:
+                    df[col] = 0.0
             
             # Defender sub-roles
             def_mask = df['position'] == 'DEF'
             if def_mask.sum() > 0:
                 # Wing-backs (high attacking returns)
-                wb_mask = (df['att_returns_rate'] > df[def_mask]['att_returns_rate'].quantile(0.7)) & def_mask
-                df.loc[wb_mask, 'player_role'] = 'DEF_WB'
+                series = pd.to_numeric(df.loc[def_mask, 'att_returns_rate'], errors='coerce').fillna(0)
+                if series.size > 0:
+                    q70 = series.quantile(0.7)
+                    q30 = series.quantile(0.3)
+                    wb_mask = (df['att_returns_rate'] > q70) & def_mask
+                    df.loc[wb_mask, 'player_role'] = 'DEF_WB'
                 
                 # Center-backs (low attacking returns, high defensive actions)
-                cb_mask = (df['att_returns_rate'] <= df[def_mask]['att_returns_rate'].quantile(0.3)) & def_mask
-                df.loc[cb_mask, 'player_role'] = 'DEF_CB'
+                cb_mask = (df['att_returns_rate'] <= q30) & def_mask if series.size > 0 else def_mask & (False)
+                if series.size > 0:
+                    df.loc[cb_mask, 'player_role'] = 'DEF_CB'
             
             # Midfielder sub-roles  
             mid_mask = df['position'] == 'MID'
@@ -315,6 +353,11 @@ class PositionSpecificFeatureEngineer:
     def _add_team_context_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """Add team-level context features"""
         try:
+            # Ensure required numeric columns exist
+            for col in ['goals_scored', 'assists', 'shots', 'minutes']:
+                if col not in df.columns:
+                    df[col] = 0
+                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
             # Team attacking style (goals scored, possession-based vs direct)
             team_stats = df.groupby('team_id').agg({
                 'goals_scored': 'sum',
