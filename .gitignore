@@ -9,13 +9,18 @@ __pycache__/
 /.vscode/
 /data/
 !/data/bootstrap/
+!/data/processed/essential/
+!/data/historical/recent/
+/data/raw/
+/data/cache/
 /logs/
 /reports/
 /models/*.pkl
+!/models/2025_26/fpl_xgb_model.pkl
 /models/archived/
-/models/2025_26/*.pkl
 !/models/minimal/
 /*.db
+!fpl_ai_2025_26.db
 *.sqlite
 *.sqlite3
 

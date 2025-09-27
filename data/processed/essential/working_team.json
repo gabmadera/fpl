@@ -1,0 +1,172 @@
+{
+  "formation": "4-4-2",
+  "starters": [
+    {
+      "name": "Ederson M.",
+      "position": "GKP",
+      "predicted_points": 11.098814555841152,
+      "now_cost": 55,
+      "player_id": 399,
+      "team_id": 13,
+      "fixture_difficulty": 3,
+      "fixture_opponent": "OPP",
+      "team_badge_url": "/static/badges/13.png",
+      "position_coords": {
+        "x": 50,
+        "y": 50
+      }
+    },
+    {
+      "name": "Zinchenko",
+      "position": "DEF",
+      "predicted_points": 13.647784197347628,
+      "now_cost": 50,
+      "player_id": 12,
+      "team_id": 1,
+      "fixture_difficulty": 3,
+      "fixture_opponent": "OPP",
+      "team_badge_url": "/static/badges/1.png",
+      "position_coords": {
+        "x": 50,
+        "y": 50
+      }
+    },
+    {
+      "name": "Frimpong",
+      "position": "DEF",
+      "predicted_points": 12.3678076537609,
+      "now_cost": 60,
+      "player_id": 370,
+      "team_id": 12,
+      "fixture_difficulty": 3,
+      "fixture_opponent": "OPP",
+      "team_badge_url": "/static/badges/12.png",
+      "position_coords": {
+        "x": 50,
+        "y": 50
+      }
+    },
+    {
+      "name": "Stones",
+      "position": "DEF",
+      "predicted_points": 11.1196131642712,
+      "now_cost": 55,
+      "player_id": 409,
+      "team_id": 13,
+      "fixture_difficulty": 3,
+      "fixture_opponent": "OPP",
+      "team_badge_url": "/static/badges/13.png",
+      "position_coords": {
+        "x": 50,
+        "y": 50
+      }
+    },
+    {
+      "name": "Gabriel",
+      "position": "DEF",
+      "predicted_points": 11.00352638673643,
+      "now_cost": 60,
+      "player_id": 5,
+      "team_id": 1,
+      "fixture_difficulty": 3,
+      "fixture_opponent": "OPP",
+      "team_badge_url": "/static/badges/1.png",
+      "position_coords": {
+        "x": 50,
+        "y": 50
+      }
+    },
+    {
+      "name": "Gakpo",
+      "position": "MID",
+      "predicted_points": 15.0,
+      "now_cost": 75,
+      "player_id": 384,
+      "team_id": 12,
+      "fixture_difficulty": 3,
+      "fixture_opponent": "OPP",
+      "team_badge_url": "/static/badges/12.png",
+      "position_coords": {
+        "x": 50,
+        "y": 50
+      }
+    },
+    {
+      "name": "Saka",
+      "position": "MID",
+      "predicted_points": 15.0,
+      "now_cost": 100,
+      "player_id": 16,
+      "team_id": 1,
+      "fixture_difficulty": 3,
+      "fixture_opponent": "OPP",
+      "team_badge_url": "/static/badges/1.png",
+      "position_coords": {
+        "x": 50,
+        "y": 50
+      }
+    },
+    {
+      "name": "Buend\u00eda",
+      "position": "MID",
+      "predicted_points": 15.0,
+      "now_cost": 55,
+      "player_id": 50,
+      "team_id": 2,
+      "fixture_difficulty": 3,
+      "fixture_opponent": "OPP",
+      "team_badge_url": "/static/badges/2.png",
+      "position_coords": {
+        "x": 50,
+        "y": 50
+      }
+    },
+    {
+      "name": "George",
+      "position": "MID",
+      "predicted_points": 15.0,
+      "now_cost": 50,
+      "player_id": 243,
+      "team_id": 7,
+      "fixture_difficulty": 3,
+      "fixture_opponent": "OPP",
+      "team_badge_url": "/static/badges/7.png",
+      "position_coords": {
+        "x": 50,
+        "y": 50
+      }
+    },
+    {
+      "name": "Isak",
+      "position": "FWD",
+      "predicted_points": 15.0,
+      "now_cost": 105,
+      "player_id": 499,
+      "team_id": 15,
+      "fixture_difficulty": 3,
+      "fixture_opponent": "OPP",
+      "team_badge_url": "/static/badges/15.png",
+      "position_coords": {
+        "x": 50,
+        "y": 50
+      }
+    },
+    {
+      "name": "Osula",
+      "position": "FWD",
+      "predicted_points": 15.0,
+      "now_cost": 55,
+      "player_id": 500,
+      "team_id": 15,
+      "fixture_difficulty": 3,
+      "fixture_opponent": "OPP",
+      "team_badge_url": "/static/badges/15.png",
+      "position_coords": {
+        "x": 50,
+        "y": 50
+      }
+    }
+  ],
+  "predicted_points": 149.2375459579573,
+  "total_cost": 720
+}

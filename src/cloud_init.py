@@ -40,19 +40,32 @@ class CloudInitializer:
             self._initialize_database()
             results["steps_completed"].append("database_initialized")
 
-            # Step 3: Create bootstrap data
+            # Step 3: Fetch real FPL data
+            data_success = self._fetch_fpl_data()
+            if data_success:
+                results["steps_completed"].append("fpl_data_fetched")
+            else:
+                results["errors"].append("FPL data fetch failed, using bootstrap")
+
+            # Step 4: Create bootstrap data (fallback)
             self._create_bootstrap_data()
             results["steps_completed"].append("bootstrap_data_created")
 
-            # Step 4: Initialize minimal models
-            self._initialize_minimal_models()
-            results["steps_completed"].append("minimal_models_created")
+            # Step 5: Load ML models
+            models_loaded = self._load_ml_models()
+            if models_loaded:
+                results["steps_completed"].append("ml_models_loaded")
+            else:
+                results["errors"].append("ML models not available, using simple predictor")
+                # Step 5b: Initialize minimal models as fallback
+                self._initialize_minimal_models()
+                results["steps_completed"].append("minimal_models_created")
 
-            # Step 5: Setup cache and state
+            # Step 6: Setup cache and state
             self._setup_cache_and_state()
             results["steps_completed"].append("cache_setup_complete")
 
-            # Step 6: Initialize accuracy tracking
+            # Step 7: Initialize accuracy tracking
             self._initialize_accuracy_tracking()
             results["steps_completed"].append("accuracy_tracking_initialized")
 
@@ -415,6 +428,63 @@ class CloudInitializer:
             json.dump(scheduler_state, f, indent=2)
 
         self.logger.info("Accuracy tracking initialized")
+
+    def _fetch_fpl_data(self) -> bool:
+        """Fetch real FPL data using CloudDataFetcher"""
+        try:
+            from .cloud_data_fetcher import CloudDataFetcher
+
+            fetcher = CloudDataFetcher()
+            success = fetcher.ensure_fpl_data()
+
+            if success:
+                self.logger.info("Successfully fetched and processed FPL data")
+                return True
+            else:
+                self.logger.warning("Failed to fetch FPL data, will use fallback")
+                return False
+
+        except Exception as e:
+            self.logger.error(f"Error in FPL data fetching: {e}")
+            return False
+
+    def _load_ml_models(self) -> bool:
+        """Load pre-trained ML models if available"""
+        try:
+            import joblib
+
+            # Check for XGBoost model
+            xgb_model_path = self.models_dir / "2025_26" / "fpl_xgb_model.pkl"
+
+            if xgb_model_path.exists():
+                self.logger.info("Loading XGBoost model...")
+
+                # Try to load the model to verify it's valid
+                model = joblib.load(xgb_model_path)
+                self.logger.info(f"Successfully loaded XGBoost model: {type(model).__name__}")
+
+                # Create model metadata
+                model_metadata = {
+                    "model_path": str(xgb_model_path),
+                    "model_type": type(model).__name__,
+                    "loaded_at": datetime.now().isoformat(),
+                    "status": "loaded",
+                    "features_count": getattr(model, 'n_features_in_', 'unknown')
+                }
+
+                # Save metadata
+                metadata_file = self.models_dir / "2025_26" / "model_metadata.json"
+                with open(metadata_file, 'w') as f:
+                    json.dump(model_metadata, f, indent=2)
+
+                return True
+            else:
+                self.logger.warning(f"XGBoost model not found at {xgb_model_path}")
+                return False
+
+        except Exception as e:
+            self.logger.error(f"Failed to load ML models: {e}")
+            return False
 
     def is_initialized(self) -> bool:
         """Check if system is already initialized"""

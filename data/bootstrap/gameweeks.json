@@ -1,0 +1,22 @@
+{
+  "current_gameweek": 6,
+  "last_finished": 5,
+  "events": [
+    {
+      "id": 5,
+      "name": "Gameweek 5",
+      "is_current": false,
+      "is_next": false,
+      "finished": true,
+      "deadline_time": "2024-09-21T10:30:00Z"
+    },
+    {
+      "id": 6,
+      "name": "Gameweek 6",
+      "is_current": true,
+      "is_next": false,
+      "finished": false,
+      "deadline_time": "2024-09-28T10:30:00Z"
+    }
+  ]
+}

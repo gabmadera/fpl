@@ -1,0 +1,25 @@
+{
+  "formation": "4-4-2",
+  "starters": [
+    {
+      "name": "A.Becker",
+      "position": "GKP",
+      "predicted_points": 4.607655502392344,
+      "now_cost": 550,
+      "player_id": 366,
+      "team_id": 12
+    },
+    {
+      "name": "Krafth",
+      "position": "DEF",
+      "predicted_points": 3.59956886227545,
+      "now_cost": 450,
+      "player_id": 479,
+      "team_id": 15
+    },
+    {
+      "name": "Heaven",
+      "position": "DEF",
+      "predicted_points": 2.40587573964497,
+      "now_cost": 400,
+      "player_id": 

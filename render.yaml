@@ -8,4 +8,8 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: "3.11"
+      - key: MODEL_PATH
+        value: "models/2025_26"
+      - key: DATA_PATH
+        value: "data"
     healthCheckPath: /cloud/health
