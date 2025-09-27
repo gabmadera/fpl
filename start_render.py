@@ -20,6 +20,23 @@ def main():
     # Ensure we're in the right directory
     os.chdir(Path(__file__).parent)
 
+    # Initialize cloud system
+    print("🔧 Initializing cloud system...")
+    try:
+        from src.cloud_init import CloudInitializer
+        cloud_init = CloudInitializer()
+        if not cloud_init.is_initialized():
+            print("🏗️  Running first-time initialization...")
+            result = cloud_init.initialize_system()
+            if result["status"] == "success":
+                print("✅ Cloud initialization completed successfully")
+            else:
+                print(f"⚠️  Initialization warning: {result['message']}")
+        else:
+            print("✅ System already initialized")
+    except Exception as e:
+        print(f"⚠️  Initialization error (continuing anyway): {e}")
+
     # Start the server
     cmd = [
         sys.executable, "-m", "uvicorn",
