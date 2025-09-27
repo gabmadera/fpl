@@ -20,8 +20,12 @@ from .model_feedback_loop import ModelFeedbackLoop
 from .aggressive_accuracy_optimizer import AggressiveAccuracyOptimizer
 from .automated_retraining_scheduler import get_retraining_scheduler, start_automated_retraining
 from .accuracy_analysis_dashboard import AccuracyAnalysisDashboard, quick_accuracy_check
+from .cloud_endpoints import router as cloud_router
 
 app = FastAPI(title="FPL AI Dashboard - Clean & Simple", version="2.0")
+
+# Include cloud endpoints for deployment
+app.include_router(cloud_router)
 
 @app.get("/health")
 def health() -> dict:

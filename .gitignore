@@ -8,11 +8,13 @@ __pycache__/
 /.idea/
 /.vscode/
 /data/
+!/data/bootstrap/
 /logs/
 /reports/
 /models/*.pkl
 /models/archived/
 /models/2025_26/*.pkl
+!/models/minimal/
 /*.db
 *.sqlite
 *.sqlite3
