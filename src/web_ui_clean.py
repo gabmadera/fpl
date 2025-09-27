@@ -137,7 +137,38 @@ def predictions(force_refresh: bool = False) -> dict:
         predictions_df = pipeline.predict_gameweek()
 
         if predictions_df.empty:
-            return {"status": "error", "message": "No predictions generated"}
+            # Final fallback: use SimplePredictor
+            try:
+                print("ML Pipeline failed, using SimplePredictor fallback...")
+                import sys
+                from pathlib import Path
+                sys.path.append(str(Path(__file__).parent.parent / "models" / "minimal"))
+                from simple_predictor import SimplePredictor
+                fallback_predictor = SimplePredictor()
+                fallback_result = fallback_predictor.predict_gameweek()
+
+                if fallback_result and 'predictions' in fallback_result:
+                    # Convert SimplePredictor format to expected DataFrame format
+                    fallback_predictions = []
+                    for player in fallback_result['predictions']:
+                        fallback_predictions.append({
+                            'player_id': player.get('id', 0),
+                            'name': player.get('name', 'Unknown'),
+                            'position': player.get('position', 'MID'),
+                            'team': player.get('team_name', 'Unknown'),
+                            'price': player.get('price', 5.0),
+                            'predicted_points': player.get('predicted_points', 2.0),
+                            'confidence': player.get('confidence', 0.5),
+                            'opponent': player.get('opponent', 'Various'),
+                            'venue': player.get('venue', 'H')
+                        })
+                    predictions_df = pd.DataFrame(fallback_predictions)
+                    print(f"Fallback generated {len(predictions_df)} player predictions")
+                else:
+                    return {"status": "error", "message": "All prediction methods failed"}
+            except Exception as e:
+                print(f"SimplePredictor fallback also failed: {e}")
+                return {"status": "error", "message": "All prediction methods failed"}
 
         # Generate team selection
         selector = TeamSelector()
@@ -164,7 +195,19 @@ def predictions(force_refresh: bool = False) -> dict:
         return {"status": "success", "from_cache": False, **team_data}
 
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        # Provide more specific error messages for debugging
+        error_message = str(e)
+        if "No module named" in error_message:
+            error_message = f"Missing dependency: {error_message}"
+        elif "FileNotFoundError" in error_message:
+            error_message = f"Model file not found: {error_message}"
+        elif "bootstrap" in error_message.lower():
+            error_message = f"FPL API data issue: {error_message}"
+        elif "xgb" in error_message.lower() or "xgboost" in error_message.lower():
+            error_message = f"XGBoost model issue: {error_message}"
+
+        print(f"Predictions endpoint error: {error_message}")
+        return {"status": "error", "message": error_message, "error_type": type(e).__name__}
 
 @app.get("/comparisons/gw-by-gw")
 def get_gw_comparisons(limit: int = 10) -> dict:
@@ -881,13 +924,13 @@ def get_enriched_predictions() -> dict:
         # Get FPL data for fixtures and teams with cloud fallback
         is_cloud = bool(os.getenv('RENDER') or os.getenv('PORT'))
         if is_cloud:
-            cloud_fpl = CloudFPLClient()
-            bootstrap = cloud_fpl.get_bootstrap_data()
-            fixtures = cloud_fpl.get_fixtures_data()
+            fpl_client = CloudFPLClient()
+            bootstrap = fpl_client.get_bootstrap_data()
+            fixtures = fpl_client.get_fixtures_data()
         else:
-            fpl = FPLClient()
-            bootstrap = fpl.bootstrap_static()
-            fixtures = fpl.fixtures()
+            fpl_client = FPLClient()
+            bootstrap = fpl_client.bootstrap_static()
+            fixtures = fpl_client.fixtures()
 
         if not bootstrap or not fixtures:
             # Use bootstrap teams data as fallback
@@ -903,7 +946,8 @@ def get_enriched_predictions() -> dict:
                 enriched_data = current_data.copy()
                 enriched_data.update({
                     "source": "bootstrap_fallback",
-                    "teams": teams_data.get('teams', [])
+                    "teams": teams_data.get('teams', []),
+                    "gameweek": current_data.get('gameweek', 6)  # Add fallback gameweek
                 })
                 return {"status": "success", **enriched_data}
             else:
@@ -912,7 +956,7 @@ def get_enriched_predictions() -> dict:
         teams = {t['id']: t for t in bootstrap.get('teams', [])}
 
         # Get next active gameweek for predictions (not finished gameweeks)
-        prediction_gw = fpl.next_active_gameweek()
+        prediction_gw = fpl_client.next_active_gameweek()
 
         # Get fixtures for prediction gameweek
         current_fixtures = [f for f in fixtures if f.get('event') == prediction_gw]
@@ -958,7 +1002,39 @@ def get_enriched_predictions() -> dict:
         }
 
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        # Provide categorized error messages for better debugging
+        error_message = str(e)
+        error_type = "general_error"
+
+        if "FileNotFoundError" in error_message or "not found" in error_message.lower():
+            error_type = "missing_file"
+            error_message = f"Data file missing: {error_message}"
+        elif "ConnectionError" in error_message or "timeout" in error_message.lower():
+            error_type = "api_connection"
+            error_message = f"FPL API connection failed: {error_message}"
+        elif "bootstrap" in error_message.lower() or "fixtures" in error_message.lower():
+            error_type = "data_fetch"
+            error_message = f"FPL data fetch failed: {error_message}"
+        elif "No module named" in error_message:
+            error_type = "missing_dependency"
+            error_message = f"Missing Python dependency: {error_message}"
+        elif "KeyError" in error_message:
+            error_type = "data_structure"
+            error_message = f"Data structure error (missing field): {error_message}"
+        elif "predict" in error_message.lower():
+            error_type = "ml_prediction"
+            error_message = f"ML prediction failed: {error_message}"
+
+        return {
+            "status": "error",
+            "message": error_message,
+            "error_type": error_type,
+            "debug_info": {
+                "original_error": str(e),
+                "endpoint": "enriched-predictions",
+                "timestamp": datetime.now().isoformat()
+            }
+        }
 
 # ==================== ACCURACY OPTIMIZATION ENDPOINTS ====================
 

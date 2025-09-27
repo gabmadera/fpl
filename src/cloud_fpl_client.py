@@ -55,18 +55,29 @@ class CloudFPLClient:
 
     def _load_fallback_data(self) -> Dict[str, Any]:
         """Load fallback data for when API is blocked"""
+        # Generate more realistic fallback events for current season
+        events = []
+        for i in range(1, 39):  # 38 gameweeks in a season
+            is_current = (i == 6)  # Current gameweek
+            is_next = (i == 7)     # Next gameweek
+            finished = (i < 6)     # Previous gameweeks are finished
+            events.append({
+                "id": i,
+                "name": f"Gameweek {i}",
+                "is_current": is_current,
+                "is_next": is_next,
+                "finished": finished
+            })
+
         fallback = {
             "bootstrap_static": {
-                "events": [
-                    {"id": 5, "name": "Gameweek 5", "is_current": True, "finished": True},
-                    {"id": 6, "name": "Gameweek 6", "is_current": False, "is_next": True, "finished": False}
-                ],
-                "elements": [],  # Will be populated
-                "teams": []      # Will be populated
+                "events": events,
+                "elements": [],  # Will be populated with basic player data
+                "teams": []      # Will be populated with basic team data
             },
             "fixtures": [],
             "current_gameweek": 6,
-            "next_gameweek": 6
+            "next_gameweek": 7
         }
         return fallback
 
@@ -122,9 +133,17 @@ class CloudFPLClient:
         """Get bootstrap static data with fallback"""
         return self._get_with_fallback("bootstrap-static/")
 
+    def get_bootstrap_data(self) -> Dict[str, Any]:
+        """Alias for bootstrap_static - for compatibility with other components"""
+        return self.bootstrap_static()
+
     def fixtures(self) -> Dict[str, Any]:
         """Get fixtures data with fallback"""
         return self._get_with_fallback("fixtures/")
+
+    def get_fixtures_data(self) -> Dict[str, Any]:
+        """Alias for fixtures - for compatibility with other components"""
+        return self.fixtures()
 
     def element_summary(self, element_id: int) -> Dict[str, Any]:
         """Get element summary with fallback"""
