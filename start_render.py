@@ -56,6 +56,35 @@ def main():
     ]
 
     print(f"🌟 Running: {' '.join(cmd)}")
+
+    # Start the server in background to allow for post-startup tasks
+    import threading
+    import time
+    import requests
+
+    def post_startup_tasks():
+        """Run post-startup tasks after server is ready"""
+        time.sleep(10)  # Wait for server to fully start
+        try:
+            print("🔥 Generating initial predictions...")
+            response = requests.get(f"http://localhost:{port}/enriched-predictions", timeout=60)
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('source') == 'fallback_predictor':
+                    print("⚠️  Using fallback predictions (ML pipeline may have failed)")
+                else:
+                    print("✅ Successfully generated ML predictions")
+            else:
+                print(f"⚠️  Prediction generation returned {response.status_code}")
+        except Exception as e:
+            print(f"⚠️  Could not generate initial predictions: {e}")
+
+    # Start post-startup tasks in background
+    startup_thread = threading.Thread(target=post_startup_tasks)
+    startup_thread.daemon = True
+    startup_thread.start()
+
+    # Run the server (this blocks)
     subprocess.run(cmd)
 
 if __name__ == "__main__":

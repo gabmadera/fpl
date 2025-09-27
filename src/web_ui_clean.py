@@ -9,6 +9,7 @@ from typing import Optional, Dict, Any
 import json
 import csv
 import os
+import logging
 
 from .ml_pipeline import MLPipeline
 from .fpl_client import FPLClient
@@ -27,6 +28,9 @@ app = FastAPI(title="FPL AI Dashboard - Clean & Simple", version="2.0")
 
 # Include cloud endpoints for deployment
 app.include_router(cloud_router)
+
+# Setup logging
+logger = logging.getLogger("FPL_UI")
 
 @app.get("/health")
 def health() -> dict:
@@ -817,9 +821,45 @@ def get_enriched_predictions() -> dict:
         # Get current predictions
         current_data = cache_manager.get_cached_data('predictions')
         if not current_data or 'team_summary' not in current_data:
-            # Try to use cloud fallback predictions
-            is_cloud = bool(os.getenv('RENDER') or os.getenv('PORT'))
-            if is_cloud:
+            # Try to generate real predictions first using ML pipeline
+            try:
+                logger.info("No cached predictions found, generating fresh predictions...")
+
+                # Use the same logic as /predictions endpoint
+                pipeline = MLPipeline()
+                predictions_df = pipeline.predict_gameweek()
+
+                if not predictions_df.empty:
+                    # Generate team selection
+                    selector = TeamSelector()
+                    team_result = selector.select_optimal_team(predictions_df)
+
+                    # Convert to cache format
+                    team_data = {
+                        'team_summary': {
+                            'total_predicted_points': team_result.predicted_points,
+                            'total_cost': team_result.total_cost,
+                            'formation': team_result.formation,
+                            'captain_id': team_result.captain_id,
+                            'vice_captain_id': team_result.vice_captain_id,
+                            'chip_recommendation': team_result.chip_recommendation,
+                            'starters': team_result.starters,
+                            'bench': team_result.bench
+                        },
+                        'gameweek': predictions_df.iloc[0].get('gameweek', 6) if len(predictions_df) > 0 else 6
+                    }
+
+                    # Cache the results
+                    cache_manager.cache_data('predictions', team_data)
+                    current_data = team_data
+                    logger.info("Successfully generated real ML predictions")
+                else:
+                    raise Exception("ML pipeline returned empty predictions")
+
+            except Exception as e:
+                logger.warning(f"ML pipeline failed: {e}, trying fallback...")
+
+                # Only now fall back to SimplePredictor
                 try:
                     import sys
                     from pathlib import Path
@@ -833,12 +873,10 @@ def get_enriched_predictions() -> dict:
                         "status": "success",
                         "team_summary": fallback_team,
                         "source": "fallback_predictor",
-                        "message": "Using fallback predictions - FPL API unavailable"
+                        "message": f"Using fallback predictions - ML pipeline failed: {str(e)}"
                     }
-                except Exception as e:
-                    return {"status": "error", "message": f"No current team suggestion available and fallback failed: {str(e)}"}
-            else:
-                return {"status": "error", "message": "No current team suggestion available"}
+                except Exception as fallback_error:
+                    return {"status": "error", "message": f"Both ML pipeline and fallback failed: ML={str(e)}, Fallback={str(fallback_error)}"}
 
         # Get FPL data for fixtures and teams with cloud fallback
         is_cloud = bool(os.getenv('RENDER') or os.getenv('PORT'))
