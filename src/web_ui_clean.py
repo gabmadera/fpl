@@ -12,6 +12,7 @@ import os
 
 from .ml_pipeline import MLPipeline
 from .fpl_client import FPLClient
+from .cloud_fpl_client import CloudFPLClient
 from .comprehensive_accuracy_tracker import ComprehensiveAccuracyTracker, GameweekSuggestion, GameweekResult
 from .cache_manager import CacheManager
 from .strategic_team_planner import StrategicTeamPlanner
@@ -33,10 +34,18 @@ def health() -> dict:
 
 @app.get("/gameweek-status")
 def get_gameweek_status() -> dict:
-    """Get current FPL gameweek status with proper caching"""
+    """Get current FPL gameweek status with cloud fallback support"""
     try:
         cache_manager = CacheManager()
-        fpl = FPLClient()
+
+        # Use cloud FPL client with fallback support
+        is_cloud = bool(os.getenv('RENDER') or os.getenv('PORT'))
+        if is_cloud:
+            cloud_fpl = CloudFPLClient()
+            fpl_data = cloud_fpl.get_bootstrap_data()
+        else:
+            fpl = FPLClient()
+            fpl_data = fpl.bootstrap_static()
 
         cache_key = 'gameweek_status'
         cached_status = cache_manager.get_cached_data(cache_key)
@@ -45,11 +54,26 @@ def get_gameweek_status() -> dict:
             return {"status": "success", "data": cached_status, "from_cache": True}
 
         try:
-            bs = fpl.bootstrap_static()
-            if not bs:
-                return {"status": "error", "message": "Could not fetch FPL data"}
+            if not fpl_data:
+                # Use bootstrap data as fallback
+                import json
+                from pathlib import Path
+                bootstrap_file = Path("data/bootstrap/gameweeks.json")
+                if bootstrap_file.exists():
+                    with open(bootstrap_file, 'r') as f:
+                        bootstrap_data = json.load(f)
+                    return {
+                        "status": "success",
+                        "data": {
+                            "current_gameweek": bootstrap_data.get("current_gameweek", 6),
+                            "events": bootstrap_data.get("events", [])
+                        },
+                        "source": "bootstrap_fallback"
+                    }
+                else:
+                    return {"status": "error", "message": "Could not fetch FPL data and no fallback available"}
 
-            events = bs.get("events", [])
+            events = fpl_data.get("events", [])
 
             current_gw = None
             next_gw = None
@@ -793,15 +817,59 @@ def get_enriched_predictions() -> dict:
         # Get current predictions
         current_data = cache_manager.get_cached_data('predictions')
         if not current_data or 'team_summary' not in current_data:
-            return {"status": "error", "message": "No current team suggestion available"}
+            # Try to use cloud fallback predictions
+            is_cloud = bool(os.getenv('RENDER') or os.getenv('PORT'))
+            if is_cloud:
+                try:
+                    import sys
+                    from pathlib import Path
+                    sys.path.append(str(Path(__file__).parent.parent))
+                    from models.minimal.simple_predictor import SimplePredictor
 
-        # Get FPL data for fixtures and teams
-        fpl = FPLClient()
-        bootstrap = fpl.bootstrap_static()
-        fixtures = fpl.fixtures()
+                    predictor = SimplePredictor()
+                    fallback_team = predictor._generate_fallback_team()
+
+                    return {
+                        "status": "success",
+                        "team_summary": fallback_team,
+                        "source": "fallback_predictor",
+                        "message": "Using fallback predictions - FPL API unavailable"
+                    }
+                except Exception as e:
+                    return {"status": "error", "message": f"No current team suggestion available and fallback failed: {str(e)}"}
+            else:
+                return {"status": "error", "message": "No current team suggestion available"}
+
+        # Get FPL data for fixtures and teams with cloud fallback
+        is_cloud = bool(os.getenv('RENDER') or os.getenv('PORT'))
+        if is_cloud:
+            cloud_fpl = CloudFPLClient()
+            bootstrap = cloud_fpl.get_bootstrap_data()
+            fixtures = cloud_fpl.get_fixtures_data()
+        else:
+            fpl = FPLClient()
+            bootstrap = fpl.bootstrap_static()
+            fixtures = fpl.fixtures()
 
         if not bootstrap or not fixtures:
-            return {"status": "error", "message": "Could not fetch FPL data"}
+            # Use bootstrap teams data as fallback
+            import json
+            from pathlib import Path
+            teams_file = Path("data/bootstrap/teams.json")
+            if teams_file.exists():
+                with open(teams_file, 'r') as f:
+                    teams_data = json.load(f)
+                teams = {t['id']: t for t in teams_data.get('teams', [])}
+
+                # Return current data with minimal team info
+                enriched_data = current_data.copy()
+                enriched_data.update({
+                    "source": "bootstrap_fallback",
+                    "teams": teams_data.get('teams', [])
+                })
+                return {"status": "success", **enriched_data}
+            else:
+                return {"status": "error", "message": "Could not fetch FPL data and no fallback available"}
 
         teams = {t['id']: t for t in bootstrap.get('teams', [])}
 
